@@ -1,3 +1,8 @@
+# --- Agent Context & Tasks ---
+GEMINI.md
+TASKS.md
+AGENTS.md
+
 # --- Environments & Secrets ---
 .env
 .env.*
