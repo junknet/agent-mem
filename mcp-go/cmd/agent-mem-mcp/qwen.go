@@ -41,10 +41,10 @@ func (c *QwenClient) ChatCompletion(ctx context.Context, model, prompt string, t
 	}
 	endpoint := joinURL(c.baseURL, "/chat/completions")
 	payload := map[string]any{
-		"model": model,
-		"messages": []map[string]string{{"role": "user", "content": prompt}},
+		"model":       model,
+		"messages":    []map[string]string{{"role": "user", "content": prompt}},
 		"temperature": temperature,
-		"max_tokens": maxTokens,
+		"max_tokens":  maxTokens,
 	}
 
 	body, err := c.postJSON(ctx, endpoint, payload)
@@ -112,7 +112,7 @@ func (c *QwenClient) Rerank(ctx context.Context, model, query string, documents 
 		},
 		"parameters": map[string]any{
 			"return_documents": false,
-			"top_n":           topN,
+			"top_n":            topN,
 		},
 	}
 	body, err := c.postJSON(ctx, endpoint, payload)

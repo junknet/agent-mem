@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -17,26 +17,27 @@ type Store struct {
 	pool *pgxpool.Pool
 }
 
-type AnchorInfo struct {
-	ProjectID string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+type ProjectRecord struct {
+	ID          string
+	ProjectName string
+	ProjectKey  string
+	OwnerID     string
 }
 
-type ExistingRecord struct {
-	ID       string
-	FileHash string
-	Version  int
+type TimelineRecord struct {
+	ID          string
+	ContentType string
+	Summary     string
+	Ts          int64
 }
 
-type SearchParams struct {
-	ProjectID      string
-	DocTypes       []string
-	KnowledgeTypes []string
-	Limit          int
-	MustLatest     bool
-	OrderBy        string
-	Since          *time.Time
+type MemoryRow struct {
+	ID          string
+	ContentType string
+	Content     string
+	Summary     string
+	Tags        []string
+	Ts          int64
 }
 
 func NewStore(databaseURL string) (*Store, error) {
@@ -60,59 +61,181 @@ func (s *Store) Close() {
 	}
 }
 
-func (s *Store) EnsureSchema(ctx context.Context, dimension int) error {
+func (s *Store) EnsureSchema(ctx context.Context, dimension int, reset bool) error {
 	if _, err := s.pool.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS vector"); err != nil {
 		return err
 	}
+	if _, err := s.pool.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS pgcrypto"); err != nil {
+		return err
+	}
+	if reset {
+		cleanup := `
+DROP TABLE IF EXISTS fragments CASCADE;
+DROP TABLE IF EXISTS memories CASCADE;
+DROP TABLE IF EXISTS projects CASCADE;
+DROP TABLE IF EXISTS knowledge CASCADE;`
+		if _, err := s.pool.Exec(ctx, cleanup); err != nil {
+			return err
+		}
+	}
 
 	schema := fmt.Sprintf(`
-CREATE TABLE IF NOT EXISTS knowledge (
-  id VARCHAR(32) PRIMARY KEY,
-  knowledge_type VARCHAR(16) NOT NULL,
-  doc_type VARCHAR(32),
-  insight_type VARCHAR(32),
-  source_type VARCHAR(16),
-  raw_content_path VARCHAR(1024),
-  project_id VARCHAR(64) NOT NULL,
-  project_name VARCHAR(128),
-  machine_id VARCHAR(32),
-  file_path VARCHAR(1024),
-  relative_path VARCHAR(512),
-  file_hash VARCHAR(64),
-  title VARCHAR(256),
+CREATE TABLE IF NOT EXISTS projects (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id TEXT NOT NULL,
+  project_key TEXT NOT NULL,
+  project_name TEXT NOT NULL,
+  machine_name TEXT,
+  project_path TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(owner_id, project_key)
+);
+
+CREATE TABLE IF NOT EXISTS memories (
+  id TEXT PRIMARY KEY,
+  project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  content_type TEXT NOT NULL,
   content TEXT NOT NULL,
+  content_hash TEXT,
+  ts BIGINT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
   summary TEXT,
-  structured_content JSONB,
-  category_l1 VARCHAR(64),
-  category_l2 VARCHAR(64),
-  category_l3 VARCHAR(64),
   tags JSONB,
-  embedding VECTOR(%d),
-  related_ids JSONB,
-  version INT,
-  is_latest BOOLEAN,
-  superseded_by VARCHAR(32),
-  supersede_reason VARCHAR(32),
-  status VARCHAR(16),
-  decay_rule VARCHAR(32),
-  expires_at TIMESTAMPTZ,
-  is_high_value BOOLEAN,
-  reproducible BOOLEAN,
-  applicable_to JSONB,
+  chunk_count INT DEFAULT 1,
+  embedding_done BOOLEAN DEFAULT false,
+  avg_embedding VECTOR(%[1]d)
+);
+
+CREATE TABLE IF NOT EXISTS fragments (
+  id TEXT PRIMARY KEY,
+  memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  chunk_index INT NOT NULL,
+  content TEXT NOT NULL,
+  embedding VECTOR(%[1]d),
+  ts TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(memory_id, chunk_index)
+);
+
+CREATE TABLE IF NOT EXISTS memory_versions (
+  id BIGSERIAL PRIMARY KEY,
+  memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  content_type TEXT NOT NULL,
+  content TEXT NOT NULL,
+  content_hash TEXT,
+  ts BIGINT NOT NULL,
+  summary TEXT,
+  tags JSONB,
+  chunk_count INT DEFAULT 1,
+  avg_embedding VECTOR(%[1]d),
   created_at TIMESTAMPTZ,
-  updated_at TIMESTAMPTZ
-);`, dimension)
+  replaced_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS memory_arbitrations (
+  id BIGSERIAL PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  candidate_memory_id TEXT,
+  new_memory_id TEXT,
+  action TEXT NOT NULL,
+  similarity DOUBLE PRECISION,
+  old_summary TEXT,
+  new_summary TEXT,
+  model TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+`, dimension)
+
 	if _, err := s.pool.Exec(ctx, schema); err != nil {
 		return err
 	}
 
+	// 迁移：为已有表添加新字段（幂等操作）
+	migrations := []string{
+		// projects 表新增 owner_id 字段
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='projects' AND column_name='owner_id') THEN
+				ALTER TABLE projects ADD COLUMN owner_id TEXT;
+			END IF;
+		END $$`,
+		// projects 表新增 project_key 字段
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='projects' AND column_name='project_key') THEN
+				ALTER TABLE projects ADD COLUMN project_key TEXT;
+			END IF;
+		END $$`,
+		// projects 表 machine_name 改为可空
+		`DO $$ BEGIN
+			IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='projects' AND column_name='machine_name' AND is_nullable='NO') THEN
+				ALTER TABLE projects ALTER COLUMN machine_name DROP NOT NULL;
+			END IF;
+		END $$`,
+		// projects 表 project_path 改为可空
+		`DO $$ BEGIN
+			IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='projects' AND column_name='project_path' AND is_nullable='NO') THEN
+				ALTER TABLE projects ALTER COLUMN project_path DROP NOT NULL;
+			END IF;
+		END $$`,
+		// 移除旧的唯一约束（machine_name, project_path）
+		`DO $$ BEGIN
+			IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='projects_machine_name_project_path_key') THEN
+				ALTER TABLE projects DROP CONSTRAINT projects_machine_name_project_path_key;
+			END IF;
+		END $$`,
+		// memories 表添加 avg_embedding 字段
+		fmt.Sprintf(`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='memories' AND column_name='avg_embedding') THEN
+				ALTER TABLE memories ADD COLUMN avg_embedding VECTOR(%d);
+			END IF;
+		END $$`, dimension),
+		// memories 表添加 updated_at 字段
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='memories' AND column_name='updated_at') THEN
+				ALTER TABLE memories ADD COLUMN updated_at TIMESTAMPTZ DEFAULT NOW();
+			END IF;
+		END $$`,
+		// memories 表添加 summary 字段（如果旧版本缺失）
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='memories' AND column_name='summary') THEN
+				ALTER TABLE memories ADD COLUMN summary TEXT;
+			END IF;
+		END $$`,
+		// memories 表添加 tags 字段
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='memories' AND column_name='tags') THEN
+				ALTER TABLE memories ADD COLUMN tags JSONB;
+			END IF;
+		END $$`,
+	}
+	for _, stmt := range migrations {
+		if _, err := s.pool.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("迁移失败: %w", err)
+		}
+	}
+
 	indexes := []string{
-		"CREATE INDEX IF NOT EXISTS knowledge_project_id_idx ON knowledge (project_id)",
-		"CREATE INDEX IF NOT EXISTS knowledge_relative_path_idx ON knowledge (relative_path)",
-		"CREATE INDEX IF NOT EXISTS knowledge_doc_type_idx ON knowledge (doc_type)",
-		"CREATE INDEX IF NOT EXISTS knowledge_knowledge_type_idx ON knowledge (knowledge_type)",
-		"CREATE INDEX IF NOT EXISTS knowledge_is_latest_idx ON knowledge (is_latest)",
-		"CREATE INDEX IF NOT EXISTS knowledge_updated_at_idx ON knowledge (updated_at)",
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_owner_key ON projects(owner_id, project_key)",
+		"CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner_id)",
+		"CREATE INDEX IF NOT EXISTS idx_projects_machine ON projects(machine_name)",
+		"CREATE INDEX IF NOT EXISTS idx_projects_path ON projects(project_path)",
+		"CREATE INDEX IF NOT EXISTS idx_projects_name ON projects(project_name)",
+		"CREATE INDEX IF NOT EXISTS idx_projects_key ON projects(project_key)",
+		"CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_id)",
+		"CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(content_type)",
+		"CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_memories_hash ON memories(content_hash)",
+		"CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_memories_avg_embedding ON memories USING hnsw (avg_embedding vector_cosine_ops)",
+		"CREATE INDEX IF NOT EXISTS idx_fragments_memory ON fragments(memory_id)",
+		"CREATE INDEX IF NOT EXISTS idx_fragments_embedding ON fragments USING hnsw (embedding vector_cosine_ops)",
+		"CREATE INDEX IF NOT EXISTS idx_fragments_fts ON fragments USING GIN (to_tsvector('simple', content))",
+		"CREATE INDEX IF NOT EXISTS idx_memory_versions_memory ON memory_versions(memory_id)",
+		"CREATE INDEX IF NOT EXISTS idx_memory_versions_project ON memory_versions(project_id)",
+		"CREATE INDEX IF NOT EXISTS idx_memory_arbitrations_project ON memory_arbitrations(project_id)",
+		"CREATE INDEX IF NOT EXISTS idx_memory_arbitrations_owner ON memory_arbitrations(owner_id)",
 	}
 	for _, stmt := range indexes {
 		if _, err := s.pool.Exec(ctx, stmt); err != nil {
@@ -122,277 +245,486 @@ CREATE TABLE IF NOT EXISTS knowledge (
 	return nil
 }
 
-func (s *Store) Begin(ctx context.Context) (pgx.Tx, error) {
-	return s.pool.Begin(ctx)
-}
-
-func (s *Store) FindLatestByRelativePath(ctx context.Context, projectID, relativePath string) (*ExistingRecord, error) {
-	query := `SELECT id, file_hash, version FROM knowledge WHERE project_id = $1 AND relative_path = $2 AND is_latest = true LIMIT 1`
-	row := s.pool.QueryRow(ctx, query, projectID, relativePath)
-	var record ExistingRecord
-	if err := row.Scan(&record.ID, &record.FileHash, &record.Version); err != nil {
-		if err == pgx.ErrNoRows {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return &record, nil
-}
-
-func (s *Store) SaveKnowledgeBlock(ctx context.Context, block *KnowledgeBlock) error {
+func (s *Store) UpsertProject(ctx context.Context, ownerID, projectKey, projectName, machineName, projectPath string) (ProjectRecord, error) {
 	query := `
-INSERT INTO knowledge (
-	id, knowledge_type, doc_type, insight_type, source_type, raw_content_path,
-	project_id, project_name, machine_id, file_path, relative_path, file_hash,
-	title, content, summary, structured_content, category_l1, category_l2, category_l3,
-	tags, embedding, related_ids, version, is_latest, superseded_by, supersede_reason,
-	status, decay_rule, expires_at, is_high_value, reproducible, applicable_to,
-	created_at, updated_at
-) VALUES (
-	$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
-	$20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34
-)`
-	structured, _ := json.Marshal(block.StructuredContent)
-	tags, _ := json.Marshal(block.Tags)
-	related, _ := json.Marshal(block.RelatedIDs)
-	applicable, _ := json.Marshal(block.ApplicableTo)
+INSERT INTO projects (owner_id, project_key, project_name, machine_name, project_path)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (owner_id, project_key)
+DO UPDATE SET project_name = EXCLUDED.project_name,
+              machine_name = CASE WHEN EXCLUDED.machine_name IS NULL OR EXCLUDED.machine_name = '' THEN projects.machine_name ELSE EXCLUDED.machine_name END,
+              project_path = CASE WHEN EXCLUDED.project_path IS NULL OR EXCLUDED.project_path = '' THEN projects.project_path ELSE EXCLUDED.project_path END,
+              updated_at = NOW()
+RETURNING id, project_name, project_key, owner_id`
 
-	if block.CreatedAt.IsZero() {
-		block.CreatedAt = time.Now().UTC()
+	var (
+		projectID   string
+		storedName  string
+		storedKey   string
+		storedOwner string
+	)
+	if err := s.pool.QueryRow(ctx, query, ownerID, projectKey, projectName, nullableString(machineName), nullableString(projectPath)).Scan(&projectID, &storedName, &storedKey, &storedOwner); err != nil {
+		return ProjectRecord{}, err
 	}
-	if block.UpdatedAt.IsZero() {
-		block.UpdatedAt = block.CreatedAt
-	}
+	return ProjectRecord{ID: projectID, ProjectName: storedName, ProjectKey: storedKey, OwnerID: storedOwner}, nil
+}
 
-	_, err := s.pool.Exec(ctx, query,
-		block.ID, block.KnowledgeType, block.DocType, block.InsightType, block.SourceType, block.RawContentPath,
-		block.ProjectID, block.ProjectName, block.MachineID, block.FilePath, block.RelativePath, block.FileHash,
-		block.Title, block.Content, block.Summary, structured, block.CategoryL1, block.CategoryL2, block.CategoryL3,
-		tags, block.Embedding, related, block.Version, block.IsLatest, block.SupersededBy, block.SupersedeReason,
-		block.Status, block.DecayRule, block.ExpiresAt, block.IsHighValue, block.Reproducible, applicable,
-		block.CreatedAt, block.UpdatedAt,
+func (s *Store) FindProjectIDByKey(ctx context.Context, ownerID, projectKey string) (string, error) {
+	query := `SELECT id FROM projects WHERE owner_id = $1 AND project_key = $2`
+	var id string
+	if err := s.pool.QueryRow(ctx, query, ownerID, projectKey).Scan(&id); err != nil {
+		if err == pgx.ErrNoRows {
+			return "", nil
+		}
+		return "", err
+	}
+	return id, nil
+}
+
+func (s *Store) BackfillProjectIdentity(ctx context.Context, ownerID string) error {
+	owner := strings.TrimSpace(ownerID)
+	if owner == "" {
+		owner = defaultOwnerID
+	}
+	if _, err := s.pool.Exec(ctx, `
+UPDATE projects
+SET owner_id = $1
+WHERE owner_id IS NULL OR owner_id = ''`, owner); err != nil {
+		return err
+	}
+	if _, err := s.pool.Exec(ctx, `
+UPDATE projects
+SET project_key = COALESCE(NULLIF(project_key, ''), NULLIF(project_path, ''), project_name)
+WHERE project_key IS NULL OR project_key = ''`); err != nil {
+		return err
+	}
+	if _, err := s.pool.Exec(ctx, `
+UPDATE projects
+SET project_name = COALESCE(NULLIF(project_name, ''), project_key)
+WHERE project_name IS NULL OR project_name = ''`); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) FindDuplicateMemory(ctx context.Context, projectID, contentHash string, sinceTs int64) (string, error) {
+	query := `SELECT id FROM memories WHERE project_id = $1 AND content_hash = $2 AND ts >= $3 LIMIT 1`
+	var id string
+	if err := s.pool.QueryRow(ctx, query, projectID, contentHash, sinceTs).Scan(&id); err != nil {
+		if err == pgx.ErrNoRows {
+			return "", nil
+		}
+		return "", err
+	}
+	return id, nil
+}
+
+func (s *Store) UpdateMemoryTimestamp(ctx context.Context, memoryID string, ts int64) error {
+	_, err := s.pool.Exec(ctx, `UPDATE memories SET ts = $2, updated_at = NOW() WHERE id = $1`, memoryID, ts)
+	return err
+}
+
+func (s *Store) InsertMemory(ctx context.Context, memory MemoryInsert) error {
+	tagsJSON, _ := json.Marshal(memory.Tags)
+	var avgVec any
+	if len(memory.AvgEmbedding) > 0 {
+		avgVec = pgvector.NewVector(memory.AvgEmbedding)
+	}
+	_, err := s.pool.Exec(ctx, `
+INSERT INTO memories (
+  id, project_id, content_type, content, content_hash, ts,
+  summary, tags, chunk_count, embedding_done, avg_embedding
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11)`,
+		memory.ID,
+		memory.ProjectID,
+		memory.ContentType,
+		memory.Content,
+		memory.ContentHash,
+		memory.Ts,
+		nullableString(memory.Summary),
+		string(tagsJSON),
+		memory.ChunkCount,
+		memory.Embedded,
+		avgVec,
 	)
 	return err
 }
 
-func (s *Store) DeprecateBlock(ctx context.Context, id, supersededBy, reason string) error {
-	query := `
-UPDATE knowledge
-SET is_latest = false, superseded_by = $2, supersede_reason = $3, status = 'deprecated', updated_at = $4
-WHERE id = $1`
-	_, err := s.pool.Exec(ctx, query, id, supersededBy, reason, time.Now().UTC())
-	return err
-}
-
-func (s *Store) DeleteBlock(ctx context.Context, tx pgx.Tx, id string) error {
-	// 支持事务内的删除
-	query := `DELETE FROM knowledge WHERE id = $1`
-	var err error
-	if tx != nil {
-		_, err = tx.Exec(ctx, query, id)
-	} else {
-		_, err = s.pool.Exec(ctx, query, id)
+func (s *Store) InsertFragments(ctx context.Context, fragments []FragmentInsert) error {
+	if len(fragments) == 0 {
+		return nil
 	}
-	return err
+	batch := &pgx.Batch{}
+	query := `
+INSERT INTO fragments (id, memory_id, chunk_index, content, embedding)
+VALUES ($1,$2,$3,$4,$5)`
+	for _, frag := range fragments {
+		batch.Queue(query, frag.ID, frag.MemoryID, frag.ChunkIndex, frag.Content, pgvector.NewVector(frag.Embedding))
+	}
+	br := s.pool.SendBatch(ctx, batch)
+	defer br.Close()
+	for range fragments {
+		if _, err := br.Exec(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (s *Store) FetchObservations(ctx context.Context, ids []string) ([]map[string]any, error) {
+func (s *Store) FetchMemories(ctx context.Context, ids []string) ([]MemoryRow, error) {
+	if len(ids) == 0 {
+		return []MemoryRow{}, nil
+	}
 	query := `
-SELECT id,
-       COALESCE(title, '') as title,
-       COALESCE(file_path, '') as file_path,
-       COALESCE(relative_path, '') as relative_path,
-       project_id,
-       COALESCE(knowledge_type, '') as knowledge_type,
-       COALESCE(doc_type, '') as doc_type,
-       COALESCE(insight_type, '') as insight_type,
-       COALESCE(source_type, '') as source_type,
-       COALESCE(summary, '') as summary,
-       content,
-       COALESCE(structured_content, '{}'::jsonb) as structured_content,
-       COALESCE(tags, '[]'::jsonb) as tags,
-       COALESCE(related_ids, '[]'::jsonb) as related_ids,
-       created_at,
-       updated_at
-FROM knowledge
+SELECT id, content_type, content, COALESCE(summary, ''), COALESCE(tags, '[]'::jsonb), ts
+FROM memories
 WHERE id = ANY($1)`
-
 	rows, err := s.pool.Query(ctx, query, ids)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var results []map[string]any
+	var results []MemoryRow
 	for rows.Next() {
-		row, err := scanObservation(rows)
-		if err != nil {
+		var (
+			row      MemoryRow
+			tagsJSON []byte
+		)
+		if err := rows.Scan(&row.ID, &row.ContentType, &row.Content, &row.Summary, &tagsJSON, &row.Ts); err != nil {
 			return nil, err
 		}
+		row.Tags = decodeTags(tagsJSON)
 		results = append(results, row)
 	}
 	return results, rows.Err()
 }
 
-func (s *Store) FetchAnchor(ctx context.Context, anchorID string) (*AnchorInfo, error) {
-	query := `SELECT project_id, created_at, COALESCE(updated_at, created_at) FROM knowledge WHERE id = $1`
-	row := s.pool.QueryRow(ctx, query, anchorID)
-	var anchor AnchorInfo
-	if err := row.Scan(&anchor.ProjectID, &anchor.CreatedAt, &anchor.UpdatedAt); err != nil {
-		if err == pgx.ErrNoRows {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return &anchor, nil
-}
-
-func (s *Store) FetchTimeline(ctx context.Context, projectID string, start, end time.Time, limit int) ([]map[string]any, error) {
+func (s *Store) FetchMemorySnapshot(ctx context.Context, memoryID string) (MemorySnapshot, error) {
 	query := `
 SELECT id,
-       COALESCE(title, '') as title,
-       COALESCE(summary, '') as summary,
-       COALESCE(doc_type, '') as doc_type,
-       COALESCE(knowledge_type, '') as knowledge_type,
-       COALESCE(relative_path, '') as relative_path,
-       updated_at,
-       created_at
-FROM knowledge
-WHERE project_id = $1 AND COALESCE(updated_at, created_at) >= $2 AND COALESCE(updated_at, created_at) <= $3
-ORDER BY COALESCE(updated_at, created_at) ASC
-LIMIT $4`
-
-	rows, err := s.pool.Query(ctx, query, projectID, start, end, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var results []map[string]any
-	for rows.Next() {
-		row, err := scanTimelineRow(rows)
-		if err != nil {
-			return nil, err
-		}
-		results = append(results, row)
-	}
-	return results, rows.Err()
-}
-
-func (s *Store) SearchByKeyword(ctx context.Context, projectID, keyword string, limit int) ([]map[string]any, error) {
-	query := `
-SELECT id, title, summary, content
-FROM knowledge
-WHERE project_id = $1 AND is_latest = true
-  AND (title ILIKE $2 OR content ILIKE $2 OR summary ILIKE $2)
-LIMIT $3`
-	like := fmt.Sprintf("%%%s%%", keyword)
-	rows, err := s.pool.Query(ctx, query, projectID, like, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var results []map[string]any
-	for rows.Next() {
-		var id, title, summary, content string
-		if err := rows.Scan(&id, &title, &summary, &content); err != nil {
-			return nil, err
-		}
-		results = append(results, map[string]any{
-			"id":      id,
-			"title":   title,
-			"summary": summary,
-			"content": content,
-		})
-	}
-	return results, rows.Err()
-}
-
-func (s *Store) SearchVector(ctx context.Context, embedding pgvector.Vector, params SearchParams) ([]SearchRow, error) {
-	query := `
-SELECT id,
-       COALESCE(title, '') as title,
-       COALESCE(file_path, '') as file_path,
-       COALESCE(summary, '') as summary,
-       content,
-       COALESCE(doc_type, '') as doc_type,
-       COALESCE(knowledge_type, '') as knowledge_type,
        project_id,
-       (embedding <=> $1) AS distance
-FROM knowledge`
+       content_type,
+       content,
+       content_hash,
+       ts,
+       COALESCE(summary, ''),
+       COALESCE(tags, '[]'::jsonb),
+       chunk_count,
+       COALESCE(avg_embedding::text, ''),
+       created_at
+FROM memories
+WHERE id = $1`
+	var (
+		row      MemorySnapshot
+		tagsJSON []byte
+		avgText  string
+	)
+	if err := s.pool.QueryRow(ctx, query, memoryID).Scan(
+		&row.ID,
+		&row.ProjectID,
+		&row.ContentType,
+		&row.Content,
+		&row.ContentHash,
+		&row.Ts,
+		&row.Summary,
+		&tagsJSON,
+		&row.ChunkCount,
+		&avgText,
+		&row.CreatedAt,
+	); err != nil {
+		return MemorySnapshot{}, err
+	}
+	row.Tags = decodeTags(tagsJSON)
+	if strings.TrimSpace(avgText) != "" {
+		var vec pgvector.Vector
+		if err := vec.Parse(avgText); err == nil {
+			row.AvgEmbedding = vec.Slice()
+		}
+	}
+	return row, nil
+}
 
-	conditions := []string{}
-	args := []any{embedding}
-	argIndex := 2
+func (s *Store) InsertMemoryVersion(ctx context.Context, version MemoryVersionInsert) error {
+	tagsJSON, _ := json.Marshal(version.Tags)
+	var avgVec any
+	if len(version.AvgEmbedding) > 0 {
+		avgVec = pgvector.NewVector(version.AvgEmbedding)
+	}
+	_, err := s.pool.Exec(ctx, `
+INSERT INTO memory_versions (
+  memory_id, project_id, content_type, content, content_hash, ts,
+  summary, tags, chunk_count, avg_embedding, created_at, replaced_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12)`,
+		version.MemoryID,
+		version.ProjectID,
+		version.ContentType,
+		version.Content,
+		version.ContentHash,
+		version.Ts,
+		nullableString(version.Summary),
+		string(tagsJSON),
+		version.ChunkCount,
+		avgVec,
+		version.CreatedAt,
+		version.ReplacedAt,
+	)
+	return err
+}
 
-	if params.MustLatest {
-		conditions = append(conditions, "is_latest = true")
-	}
-	if params.ProjectID != "" {
-		conditions = append(conditions, fmt.Sprintf("project_id = $%d", argIndex))
-		args = append(args, params.ProjectID)
-		argIndex++
-	}
-	if len(params.DocTypes) > 0 {
-		conditions = append(conditions, fmt.Sprintf("doc_type = ANY($%d)", argIndex))
-		args = append(args, params.DocTypes)
-		argIndex++
-	}
-	if len(params.KnowledgeTypes) > 0 {
-		conditions = append(conditions, fmt.Sprintf("knowledge_type = ANY($%d)", argIndex))
-		args = append(args, params.KnowledgeTypes)
-		argIndex++
-	}
-	if params.Since != nil {
-		conditions = append(conditions, fmt.Sprintf("COALESCE(updated_at, created_at) >= $%d", argIndex))
-		args = append(args, *params.Since)
-		argIndex++
-	}
-	if len(conditions) > 0 {
-		query += " WHERE " + strings.Join(conditions, " AND ")
-	}
+func (s *Store) InsertArbitrationLog(ctx context.Context, log ArbitrationLogInsert) error {
+	_, err := s.pool.Exec(ctx, `
+INSERT INTO memory_arbitrations (
+  owner_id, project_id, candidate_memory_id, new_memory_id,
+  action, similarity, old_summary, new_summary, model, created_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		log.OwnerID,
+		log.ProjectID,
+		nullableString(log.CandidateMemoryID),
+		nullableString(log.NewMemoryID),
+		log.Action,
+		log.Similarity,
+		nullableString(log.OldSummary),
+		nullableString(log.NewSummary),
+		nullableString(log.Model),
+		log.CreatedAt,
+	)
+	return err
+}
 
-	if params.OrderBy == "time_desc" {
-		query += " ORDER BY COALESCE(updated_at, created_at) DESC"
-	} else {
-		query += " ORDER BY embedding <=> $1"
+func (s *Store) FetchTimeline(ctx context.Context, projectID string, sinceTs int64, limit int) ([]TimelineRecord, error) {
+	query := `
+SELECT id, content_type, COALESCE(summary, ''), ts
+FROM memories
+WHERE project_id = $1 AND ts >= $2
+ORDER BY ts DESC
+LIMIT $3`
+	rows, err := s.pool.Query(ctx, query, projectID, sinceTs, limit)
+	if err != nil {
+		return nil, err
 	}
+	defer rows.Close()
+	var results []TimelineRecord
+	for rows.Next() {
+		var row TimelineRecord
+		if err := rows.Scan(&row.ID, &row.ContentType, &row.Summary, &row.Ts); err != nil {
+			return nil, err
+		}
+		results = append(results, row)
+	}
+	return results, rows.Err()
+}
 
-	query += fmt.Sprintf(" LIMIT $%d", argIndex)
-	args = append(args, params.Limit)
+func (s *Store) FetchTimelineByOwner(ctx context.Context, ownerID string, sinceTs int64, limit int) ([]TimelineRecord, error) {
+	query := `
+SELECT m.id, m.content_type, COALESCE(m.summary, ''), m.ts
+FROM memories m
+JOIN projects p ON m.project_id = p.id
+WHERE p.owner_id = $1 AND m.ts >= $2
+ORDER BY m.ts DESC
+LIMIT $3`
+	rows, err := s.pool.Query(ctx, query, ownerID, sinceTs, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var results []TimelineRecord
+	for rows.Next() {
+		var row TimelineRecord
+		if err := rows.Scan(&row.ID, &row.ContentType, &row.Summary, &row.Ts); err != nil {
+			return nil, err
+		}
+		results = append(results, row)
+	}
+	return results, rows.Err()
+}
+
+func (s *Store) ListProjects(ctx context.Context, ownerID string, limit int) ([]ProjectListItem, error) {
+	query := `
+SELECT p.owner_id,
+       p.project_key,
+       p.machine_name,
+       p.project_path,
+       p.project_name,
+       COUNT(m.id) as memory_count,
+       COALESCE(MAX(m.ts), 0) as latest_ts
+FROM projects p
+LEFT JOIN memories m ON m.project_id = p.id
+WHERE ($1 = '' OR p.owner_id = $1)
+GROUP BY p.id
+ORDER BY COALESCE(MAX(m.ts), 0) DESC
+LIMIT $2`
+
+	rows, err := s.pool.Query(ctx, query, ownerID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []ProjectListItem
+	for rows.Next() {
+		var item ProjectListItem
+		var machineName sql.NullString
+		var projectPath sql.NullString
+		if err := rows.Scan(&item.OwnerID, &item.ProjectKey, &machineName, &projectPath, &item.ProjectName, &item.MemoryCount, &item.LatestTs); err != nil {
+			return nil, err
+		}
+		item.MachineName = machineName.String
+		item.ProjectPath = projectPath.String
+		results = append(results, item)
+	}
+	return results, rows.Err()
+}
+
+// MemoryVectorRow represents a memory with its vector distance for conflict detection
+type MemoryVectorRow struct {
+	ID          string
+	ContentType string
+	Distance    float64
+}
+
+// MemorySummaryRow 用于仲裁时获取旧摘要
+type MemorySummaryRow struct {
+	ID      string
+	Summary string
+}
+
+// FetchMemorySummary 获取指定 memory 的摘要（用于仲裁）
+func (s *Store) FetchMemorySummary(ctx context.Context, memoryID string) (MemorySummaryRow, error) {
+	query := `SELECT id, COALESCE(summary, '') FROM memories WHERE id = $1`
+	var row MemorySummaryRow
+	if err := s.pool.QueryRow(ctx, query, memoryID).Scan(&row.ID, &row.Summary); err != nil {
+		return MemorySummaryRow{}, err
+	}
+	return row, nil
+}
+
+// SearchMemoryVectors searches memories by avg_embedding for semantic conflict detection
+// 只按 project_id 过滤，不按 content_type（因为类型不严格互斥）
+func (s *Store) SearchMemoryVectors(ctx context.Context, vector pgvector.Vector, projectID string, limit int) ([]MemoryVectorRow, error) {
+	query := `
+SELECT id, content_type, (avg_embedding <=> $1) AS distance
+FROM memories
+WHERE project_id = $2 AND avg_embedding IS NOT NULL
+ORDER BY avg_embedding <=> $1
+LIMIT $3`
+	rows, err := s.pool.Query(ctx, query, vector, projectID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []MemoryVectorRow
+	for rows.Next() {
+		var row MemoryVectorRow
+		if err := rows.Scan(&row.ID, &row.ContentType, &row.Distance); err != nil {
+			return nil, err
+		}
+		results = append(results, row)
+	}
+	return results, rows.Err()
+}
+
+func (s *Store) SearchVectorFragments(ctx context.Context, vector pgvector.Vector, projectID, scope string, limit int) ([]FragmentRow, error) {
+	query := `
+SELECT f.id, f.memory_id, f.chunk_index, f.content, m.content_type, m.ts, m.chunk_count, (f.embedding <=> $1) AS distance
+FROM fragments f
+JOIN memories m ON f.memory_id = m.id
+WHERE m.project_id = $2`
+	args := []any{vector, projectID}
+	if scope != "all" && scope != "" {
+		query += " AND m.content_type = $3"
+		args = append(args, scope)
+	}
+	query += " ORDER BY f.embedding <=> $1 LIMIT $" + fmt.Sprintf("%d", len(args)+1)
+	args = append(args, limit)
 
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
-	var results []SearchRow
-	for rows.Next() {
-		var row SearchRow
-		var distance float64
-		if err := rows.Scan(&row.ID, &row.Title, &row.FilePath, &row.Summary, &row.Content, &row.DocType, &row.KnowledgeType, &row.ProjectID, &distance); err != nil {
-			return nil, err
-		}
-		row.Score = 1 - distance
-		results = append(results, row)
-	}
-	return results, rows.Err()
+	return scanFragmentRows(rows)
 }
 
-func (s *Store) SearchSimilar(ctx context.Context, embedding pgvector.Vector, projectID string, docType string, limit int) ([]map[string]any, error) {
+func (s *Store) SearchVectorFragmentsByOwner(ctx context.Context, vector pgvector.Vector, ownerID, scope string, limit int) ([]FragmentRow, error) {
 	query := `
-SELECT id, content, doc_type, (embedding <=> $1) AS distance
-FROM knowledge
-WHERE is_latest = true AND project_id = $2
-`
-	args := []any{embedding, projectID}
-	if docType != "" {
-		query += " AND doc_type = $3"
-		args = append(args, docType)
+SELECT f.id, f.memory_id, f.chunk_index, f.content, m.content_type, m.ts, m.chunk_count, (f.embedding <=> $1) AS distance
+FROM fragments f
+JOIN memories m ON f.memory_id = m.id
+JOIN projects p ON m.project_id = p.id
+WHERE p.owner_id = $2`
+	args := []any{vector, ownerID}
+	if scope != "all" && scope != "" {
+		query += " AND m.content_type = $3"
+		args = append(args, scope)
 	}
-	query += " ORDER BY embedding <=> $1 LIMIT $" + fmt.Sprintf("%d", len(args)+1)
+	query += " ORDER BY f.embedding <=> $1 LIMIT $" + fmt.Sprintf("%d", len(args)+1)
+	args = append(args, limit)
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanFragmentRows(rows)
+}
+
+func (s *Store) SearchKeywordFragments(ctx context.Context, keyword, projectID, scope string, limit int) ([]FragmentRow, error) {
+	query := `
+SELECT f.id, f.memory_id, f.chunk_index, f.content, m.content_type, m.ts, m.chunk_count, 0 AS distance
+FROM fragments f
+JOIN memories m ON f.memory_id = m.id
+WHERE m.project_id = $1 AND f.content ILIKE $2`
+	args := []any{projectID, fmt.Sprintf("%%%s%%", keyword)}
+	if scope != "all" && scope != "" {
+		query += " AND m.content_type = $3"
+		args = append(args, scope)
+	}
+	query += " ORDER BY m.ts DESC LIMIT $" + fmt.Sprintf("%d", len(args)+1)
+	args = append(args, limit)
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanFragmentRows(rows)
+}
+
+func (s *Store) SearchKeywordFragmentsByOwner(ctx context.Context, keyword, ownerID, scope string, limit int) ([]FragmentRow, error) {
+	query := `
+SELECT f.id, f.memory_id, f.chunk_index, f.content, m.content_type, m.ts, m.chunk_count, 0 AS distance
+FROM fragments f
+JOIN memories m ON f.memory_id = m.id
+JOIN projects p ON m.project_id = p.id
+WHERE p.owner_id = $1 AND f.content ILIKE $2`
+	args := []any{ownerID, fmt.Sprintf("%%%s%%", keyword)}
+	if scope != "all" && scope != "" {
+		query += " AND m.content_type = $3"
+		args = append(args, scope)
+	}
+	query += " ORDER BY m.ts DESC LIMIT $" + fmt.Sprintf("%d", len(args)+1)
+	args = append(args, limit)
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanFragmentRows(rows)
+}
+
+func (s *Store) SearchBM25Fragments(ctx context.Context, keyword, projectID, scope string, limit int) ([]FragmentRow, error) {
+	query := `
+SELECT f.id, f.memory_id, f.chunk_index, f.content, m.content_type, m.ts, m.chunk_count,
+       ts_rank_cd(to_tsvector('simple', f.content), plainto_tsquery('simple', $2)) AS rank
+FROM fragments f
+JOIN memories m ON f.memory_id = m.id
+WHERE m.project_id = $1 AND to_tsvector('simple', f.content) @@ plainto_tsquery('simple', $2)`
+	args := []any{projectID, keyword}
+	if scope != "all" && scope != "" {
+		query += " AND m.content_type = $3"
+		args = append(args, scope)
+	}
+	query += " ORDER BY rank DESC LIMIT $" + fmt.Sprintf("%d", len(args)+1)
 	args = append(args, limit)
 
 	rows, err := s.pool.Query(ctx, query, args...)
@@ -401,94 +733,90 @@ WHERE is_latest = true AND project_id = $2
 	}
 	defer rows.Close()
 
-	var results []map[string]any
+	var results []FragmentRow
 	for rows.Next() {
-		var id, content, docTypeValue string
-		var distance float64
-		if err := rows.Scan(&id, &content, &docTypeValue, &distance); err != nil {
+		var row FragmentRow
+		if err := rows.Scan(&row.FragmentID, &row.MemoryID, &row.ChunkIndex, &row.Content, &row.ContentType, &row.Ts, &row.ChunkCount, &row.RankScore); err != nil {
 			return nil, err
 		}
-		results = append(results, map[string]any{
-			"id":         id,
-			"content":    content,
-			"doc_type":   docTypeValue,
-			"distance":   distance,
-			"similarity": 1 - distance,
-		})
+		results = append(results, row)
 	}
 	return results, rows.Err()
 }
 
-func scanTimelineRow(rows pgx.Rows) (map[string]any, error) {
-	var (
-		id, title, summary, docType, knowledgeType, relativePath string
-		updatedAt, createdAt                                     time.Time
-	)
-	if err := rows.Scan(&id, &title, &summary, &docType, &knowledgeType, &relativePath, &updatedAt, &createdAt); err != nil {
+func (s *Store) SearchBM25FragmentsByOwner(ctx context.Context, keyword, ownerID, scope string, limit int) ([]FragmentRow, error) {
+	query := `
+SELECT f.id, f.memory_id, f.chunk_index, f.content, m.content_type, m.ts, m.chunk_count,
+       ts_rank_cd(to_tsvector('simple', f.content), plainto_tsquery('simple', $2)) AS rank
+FROM fragments f
+JOIN memories m ON f.memory_id = m.id
+JOIN projects p ON m.project_id = p.id
+WHERE p.owner_id = $1 AND to_tsvector('simple', f.content) @@ plainto_tsquery('simple', $2)`
+	args := []any{ownerID, keyword}
+	if scope != "all" && scope != "" {
+		query += " AND m.content_type = $3"
+		args = append(args, scope)
+	}
+	query += " ORDER BY rank DESC LIMIT $" + fmt.Sprintf("%d", len(args)+1)
+	args = append(args, limit)
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
 		return nil, err
 	}
-	stamp := updatedAt
-	if stamp.IsZero() {
-		stamp = createdAt
+	defer rows.Close()
+
+	var results []FragmentRow
+	for rows.Next() {
+		var row FragmentRow
+		if err := rows.Scan(&row.FragmentID, &row.MemoryID, &row.ChunkIndex, &row.Content, &row.ContentType, &row.Ts, &row.ChunkCount, &row.RankScore); err != nil {
+			return nil, err
+		}
+		results = append(results, row)
 	}
-	return map[string]any{
-		"id":             id,
-		"title":          title,
-		"summary":        summary,
-		"doc_type":       docType,
-		"knowledge_type": knowledgeType,
-		"relative_path":  relativePath,
-		"updated_at":     formatTime(stamp),
-	}, nil
+	return results, rows.Err()
 }
 
-func scanObservation(rows pgx.Rows) (map[string]any, error) {
-	var (
-		id, title, filePath, relativePath, projectID, knowledgeType, docType, insightType, sourceType string
-		summary, content                                                                              string
-		structuredRaw, tagsRaw, relatedRaw                                                            []byte
-		createdAt, updatedAt                                                                          time.Time
-	)
-	if err := rows.Scan(
-		&id,
-		&title,
-		&filePath,
-		&relativePath,
-		&projectID,
-		&knowledgeType,
-		&docType,
-		&insightType,
-		&sourceType,
-		&summary,
-		&content,
-		&structuredRaw,
-		&tagsRaw,
-		&relatedRaw,
-		&createdAt,
-		&updatedAt,
-	); err != nil {
-		return nil, err
+func scanFragmentRows(rows pgx.Rows) ([]FragmentRow, error) {
+	var results []FragmentRow
+	for rows.Next() {
+		var row FragmentRow
+		if err := rows.Scan(&row.FragmentID, &row.MemoryID, &row.ChunkIndex, &row.Content, &row.ContentType, &row.Ts, &row.ChunkCount, &row.Distance); err != nil {
+			return nil, err
+		}
+		results = append(results, row)
 	}
-	structured := decodeJSON(structuredRaw)
-	tags := decodeJSON(tagsRaw)
-	related := decodeJSON(relatedRaw)
+	return results, rows.Err()
+}
 
-	return map[string]any{
-		"id":                 id,
-		"title":              title,
-		"file_path":          filePath,
-		"relative_path":      relativePath,
-		"project_id":         projectID,
-		"knowledge_type":     knowledgeType,
-		"doc_type":           docType,
-		"insight_type":       insightType,
-		"source_type":        sourceType,
-		"summary":            summary,
-		"content":            content,
-		"structured_content": structured,
-		"tags":               tags,
-		"related_ids":        related,
-		"created_at":         formatTime(createdAt),
-		"updated_at":         formatTime(updatedAt),
-	}, nil
+func decodeTags(raw []byte) []string {
+	if len(raw) == 0 {
+		return []string{}
+	}
+	var tags []string
+	if err := json.Unmarshal(raw, &tags); err == nil {
+		return normalizeTags(tags)
+	}
+	return []string{}
+}
+
+func baseName(path string) string {
+	trimmed := strings.TrimRight(path, "/\\")
+	if trimmed == "" {
+		return path
+	}
+	parts := strings.FieldsFunc(trimmed, func(r rune) bool {
+		return r == '/' || r == '\\'
+	})
+	if len(parts) == 0 {
+		return trimmed
+	}
+	return parts[len(parts)-1]
+}
+
+func nullableString(value string) any {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return value
 }

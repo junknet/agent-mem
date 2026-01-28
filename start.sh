@@ -1,42 +1,30 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
 cd "$(dirname "$0")"
 
 echo "=========================================="
-echo "  Project Cortex - Starting Services"
+echo "  Agent Memory - Starting Services"
 echo "=========================================="
 
-# 1. Start Database
-echo "[1/4] Starting Database..."
-docker-compose up -d
+if command -v docker >/dev/null 2>&1; then
+  if docker compose version >/dev/null 2>&1; then
+    echo "[1/3] 启动数据库（Docker Compose）..."
+    docker compose up -d
+  else
+    echo "[1/3] 未检测到 docker compose，跳过数据库启动"
+  fi
+else
+  echo "[1/3] 未检测到 Docker，跳过数据库启动"
+fi
 
-# 2. Wait for DB
-echo "[2/4] Waiting for DB to be ready..."
-sleep 3
+echo "[2/3] 编译 MCP 服务..."
+mkdir -p out
+(cd mcp-go && go build -o ../out/agent-mem-mcp ./cmd/agent-mem-mcp)
 
-# 3. Start API Server (Background)
-echo "[3/4] Starting API Server..."
-export PYTHONPATH="$(pwd)"
-export PYTHONUNBUFFERED=1
-nohup .venv/bin/python src/server.py > server.log 2>&1 &
-API_PID=$!
-echo "      API Server PID: $API_PID"
+echo "[3/3] 启动 MCP 服务..."
+AGENT_MEM_HOST="${AGENT_MEM_HOST:-127.0.0.1}"
+AGENT_MEM_PORT="${AGENT_MEM_PORT:-8787}"
+AGENT_MEM_TRANSPORT="${AGENT_MEM_TRANSPORT:-http}"
 
-# 4. Start Watcher (Background)
-echo "[4/4] Starting File Watcher..."
-nohup .venv/bin/python src/watcher.py > watcher.log 2>&1 &
-WATCHER_PID=$!
-echo "      Watcher PID: $WATCHER_PID"
-
-echo ""
-echo "=========================================="
-echo "  Project Cortex is running!"
-echo "=========================================="
-echo ""
-echo "  API Docs:  http://localhost:8000/docs"
-echo "  Query:     curl -X POST http://localhost:8000/query -H 'Content-Type: application/json' -d '{"\""query"\"": "\""test"\""}'"
-echo ""
-echo "  View logs: tail -f server.log watcher.log"
-echo "  Stop:      pkill -f 'src/server.py' && pkill -f 'src/watcher.py'"
-echo ""
+./out/agent-mem-mcp --host "$AGENT_MEM_HOST" --port "$AGENT_MEM_PORT" --transport "$AGENT_MEM_TRANSPORT"

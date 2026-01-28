@@ -1,10 +1,13 @@
 # 架构设计
 
 ## 模块划分
-- **Watcher**: 监控文件系统，实现防抖。
-- **Ingester**: 核心流水线控制器。
-- **Distiller**: 对话提炼器 (LLM)。
-- **Arbiter**: 新旧版本仲裁器 (LLM)。
+- **Ingester**：入库流水线控制器。
+- **Embedder**：片段向量化与 memory 级向量。
+- **Arbiter**：LLM 仲裁（REPLACE / KEEP_BOTH / SKIP）。
+- **Searcher**：混合检索（向量 + 关键词 + BM25 + RRF）。
 
 ## 数据流
-File -> Watcher -> Classifier -> (Distiller) -> Embedder -> Arbiter -> DB
+
+LLM/Client Trigger → Ingester → Chunking → Embedder → Arbiter → DB
+
+检索：Search → Get

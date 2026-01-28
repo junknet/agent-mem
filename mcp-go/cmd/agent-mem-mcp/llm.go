@@ -2,31 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode"
 )
 
 type LLMClient struct {
 	settings Settings
 	client   *QwenClient
 	mock     bool
-}
-
-type DistillResult struct {
-	Summary      string
-	InsightType  string
-	Problem      string
-	Thinking     []string
-	Solution     string
-	Result       []string
-	Reproducible bool
-	ApplicableTo []string
-	Tags         []string
-}
-
-type Relation struct {
-	Keyword      string
-	RelationType string
 }
 
 func NewLLMClient(settings Settings) *LLMClient {
@@ -36,36 +21,6 @@ func NewLLMClient(settings Settings) *LLMClient {
 		client:   NewQwenClient(settings),
 		mock:     mock,
 	}
-}
-
-func (l *LLMClient) DistillDialogue(content, projectID string) DistillResult {
-	if l.mock {
-		return l.mockDistill(content)
-	}
-	prompt := buildDistillPrompt(content, projectID)
-	raw, err := l.client.ChatCompletion(context.Background(), l.settings.LLM.ModelDistill, prompt, 0.3, 2000)
-	if err != nil {
-		return l.mockDistill(content)
-	}
-	parsed := parseJSON(raw)
-	if parsed == nil {
-		return l.fallbackDistill(raw)
-	}
-	result := DistillResult{
-		Summary:      getString(parsed, "summary"),
-		InsightType:  getString(parsed, "insight_type"),
-		Problem:      getString(parsed, "problem"),
-		Thinking:     getStringSlice(parsed, "thinking"),
-		Solution:     getString(parsed, "solution"),
-		Result:       getStringSlice(parsed, "result"),
-		Reproducible: getBool(parsed, "reproducible"),
-		ApplicableTo: getStringSlice(parsed, "applicable_to"),
-		Tags:         getStringSlice(parsed, "tags"),
-	}
-	if result.Summary == "" {
-		result.Summary = "对话提炼"
-	}
-	return result
 }
 
 func (l *LLMClient) Summarize(content string) string {
@@ -80,89 +35,79 @@ func (l *LLMClient) Summarize(content string) string {
 	return strings.TrimSpace(raw)
 }
 
-func (l *LLMClient) ExtractRelations(content string) []Relation {
+func (l *LLMClient) ExtractTags(content string) []string {
 	if l.mock {
-		return []Relation{}
+		return fallbackTags(content)
 	}
-	prompt := `从文档中提取可能引用或依赖的知识关键词，输出 JSON 数组：
-[
-  {"keyword": "内存泄漏复盘", "relation_type": "references"},
-  {"keyword": "v2 需求文档", "relation_type": "based_on"}
-]
-
-允许的 relation_type: based_on / references / implements / validates / supersedes
-
-文档：
-` + truncate(content, 8000)
-	raw, err := l.client.ChatCompletion(context.Background(), l.settings.LLM.ModelRelation, prompt, 0.2, 400)
+	prompt := "请从以下文本中提取 3-10 个简短标签，输出 JSON 数组（字符串列表），不要输出其他内容。\n\n文本：\n" + truncate(content, 8000)
+	raw, err := l.client.ChatCompletion(context.Background(), l.settings.LLM.ModelSummary, prompt, 0.2, 200)
 	if err != nil {
-		return []Relation{}
+		return fallbackTags(content)
 	}
-	parsed := parseJSONArray(raw)
-	if parsed == nil {
-		return []Relation{}
+	cleaned := strings.TrimSpace(raw)
+	if strings.HasPrefix(cleaned, "```") {
+		cleaned = strings.Trim(cleaned, "`")
+		cleaned = strings.TrimSpace(strings.TrimPrefix(cleaned, "json"))
 	}
-	var results []Relation
-	for _, item := range parsed {
-		keyword := strings.TrimSpace(getString(item, "keyword"))
-		relationType := strings.TrimSpace(getString(item, "relation_type"))
-		if keyword == "" || relationType == "" {
-			continue
-		}
-		results = append(results, Relation{Keyword: keyword, RelationType: relationType})
+	var tags []string
+	if err := json.Unmarshal([]byte(cleaned), &tags); err == nil {
+		return normalizeTags(tags)
 	}
-	return results
-}
-
-func (l *LLMClient) RouteQuery(query string) Route {
-	intent := l.fallbackIntent(query)
-	if !l.mock {
-		prompt := `你是一个技术文档管理员。请根据用户问题的意图，将其精准分类为以下标签之一：
-
-- decision: 涉及技术选型、架构决策、"为什么"、权衡对比 (e.g. "为什么选Go", "React vs Vue")
-- debug: 涉及报错、故障排查、Bug修复 (e.g. "OOM怎么解", "Error: 500")
-- howto: 涉及具体操作步骤、配置方法、部署流程 (e.g. "如何配置Nginx", "部署脚本")
-- progress: 涉及项目进度、状态、任务清单 (e.g. "完成了多少", "本周计划")
-- background: 纯粹的概念解释、需求描述、历史背景，且不包含上述特征 (e.g. "什么是MCP", "V1需求文档")
-
-用户问题：` + query + `
-
-只输出一个标签，不要包含其他文字。`
-
-		raw, err := l.client.ChatCompletion(context.Background(), l.settings.LLM.ModelRoute, prompt, 0.0, 10)
-		if err == nil {
-			value := strings.TrimSpace(strings.ToLower(raw))
-			// 移除所有标点
-			value = strings.Map(func(r rune) rune {
-				if r == '.' || r == '"' || r == '\'' || r == ',' {
-					return -1
+	if parsed := parseJSONArray(raw); parsed != nil {
+		var fallback []string
+		for _, item := range parsed {
+			for _, value := range item {
+				if s, ok := value.(string); ok {
+					fallback = append(fallback, s)
 				}
-				return r
-			}, value)
-			if value == "progress" || value == "decision" || value == "howto" || value == "debug" || value == "background" {
-				intent = value
 			}
 		}
+		return normalizeTags(fallback)
 	}
-	return l.routeFromIntent(intent)
+	return fallbackTags(raw)
 }
 
-func (l *LLMClient) ArbitrateConflict(newContent, oldContent string) string {
+func (l *LLMClient) ExpandQuery(query string) []string {
+	if !l.settings.QueryExpand.Enabled {
+		return fallbackQueryKeywords(query, l.settings.QueryExpand.MaxKeywords)
+	}
 	if l.mock {
-		return "supplement"
+		return fallbackQueryKeywords(query, l.settings.QueryExpand.MaxKeywords)
 	}
-	prompt := "判断下面两段文档的关系，只输出以下之一：\nreplace / supplement / conflict / unrelated\n\n旧文档：\n" + truncate(oldContent, 4000) + "\n\n新文档：\n" + truncate(newContent, 4000)
-	raw, err := l.client.ChatCompletion(context.Background(), l.settings.LLM.ModelArbitrate, prompt, 0.0, 10)
+	model := strings.TrimSpace(l.settings.QueryExpand.Model)
+	if model == "" {
+		model = l.settings.LLM.ModelSummary
+	}
+	maxKeywords := l.settings.QueryExpand.MaxKeywords
+	if maxKeywords <= 0 {
+		maxKeywords = 6
+	}
+	prompt := fmt.Sprintf("请将以下检索问题扩展为 %d 个以内的关键词或同义短语，输出 JSON 数组（字符串列表），不要输出其他内容。\\n\\n问题：\\n%s", maxKeywords, truncate(query, 2000))
+	raw, err := l.client.ChatCompletion(context.Background(), model, prompt, 0.2, 200)
 	if err != nil {
-		return "supplement"
+		return fallbackQueryKeywords(query, maxKeywords)
 	}
-	value := strings.TrimSpace(strings.ToLower(raw))
-	switch value {
-	case "replace", "supplement", "conflict", "unrelated":
-		return value
-	default:
-		return "supplement"
+	cleaned := strings.TrimSpace(raw)
+	if strings.HasPrefix(cleaned, "```") {
+		cleaned = strings.Trim(cleaned, "`")
+		cleaned = strings.TrimSpace(strings.TrimPrefix(cleaned, "json"))
 	}
+	var items []string
+	if err := json.Unmarshal([]byte(cleaned), &items); err == nil {
+		return limitTags(normalizeTags(items), maxKeywords)
+	}
+	if parsed := parseJSONArray(raw); parsed != nil {
+		var fallback []string
+		for _, item := range parsed {
+			for _, value := range item {
+				if s, ok := value.(string); ok {
+					fallback = append(fallback, s)
+				}
+			}
+		}
+		return limitTags(normalizeTags(fallback), maxKeywords)
+	}
+	return fallbackQueryKeywords(query, maxKeywords)
 }
 
 func (l *LLMClient) Rerank(query string, documents []string, topN int) ([]RerankResult, error) {
@@ -179,109 +124,136 @@ func (l *LLMClient) Rerank(query string, documents []string, topN int) ([]Rerank
 	return l.client.Rerank(context.Background(), model, query, documents, topN)
 }
 
-func (l *LLMClient) fallbackIntent(query string) string {
-	q := strings.ToLower(query)
+// ArbitrateResult 仲裁结果
+type ArbitrateResult string
+
+const (
+	ArbitrateReplace  ArbitrateResult = "REPLACE"   // 新内容替换旧内容
+	ArbitrateKeepBoth ArbitrateResult = "KEEP_BOTH" // 保留两者，新建记忆
+	ArbitrateSkip     ArbitrateResult = "SKIP"      // 跳过，不写入
+)
+
+// Arbitrate 判断新知识与已有知识的关系
+// 输入：新摘要、旧摘要
+// 输出：REPLACE / KEEP_BOTH / SKIP
+func (l *LLMClient) Arbitrate(newSummary, oldSummary string) ArbitrateResult {
+	if l.mock {
+		// mock 模式：简单规则判断
+		return mockArbitrate(newSummary, oldSummary)
+	}
+
+	model := strings.TrimSpace(l.settings.LLM.ModelArbitrate)
+	if model == "" {
+		model = "qwen-flash" // 默认用便宜快速的模型
+	}
+
+	prompt := fmt.Sprintf(`你是知识库管理员。判断新知识与已有知识的关系。
+
+【已有知识摘要】
+%s
+
+【新知识摘要】
+%s
+
+请判断：
+1. 如果新知识是旧知识的更新/修正/补充版本（同一主题的迭代）→ 输出 REPLACE
+2. 如果新旧知识主题不同，只是表述相似（不同主题）→ 输出 KEEP_BOTH
+3. 如果新旧知识几乎完全相同，无新增价值（重复内容）→ 输出 SKIP
+
+只输出一个词：REPLACE 或 KEEP_BOTH 或 SKIP`, oldSummary, newSummary)
+
+	raw, err := l.client.ChatCompletion(context.Background(), model, prompt, 0.1, 20)
+	if err != nil {
+		// 出错时保守处理：保留两者
+		return ArbitrateKeepBoth
+	}
+
+	result := strings.TrimSpace(strings.ToUpper(raw))
 	switch {
-	case strings.Contains(q, "进度") || strings.Contains(q, "状态") || strings.Contains(q, "完成"):
-		return "progress"
-	case strings.Contains(q, "为什么") || strings.Contains(q, "选") || strings.Contains(q, "决策"):
-		return "decision"
-	case strings.Contains(q, "怎么") || strings.Contains(q, "如何") || strings.Contains(q, "部署"):
-		return "howto"
-	case strings.Contains(q, "bug") || strings.Contains(q, "报错") || strings.Contains(q, "排查") || strings.Contains(q, "错误"):
-		return "debug"
+	case strings.Contains(result, "REPLACE"):
+		return ArbitrateReplace
+	case strings.Contains(result, "SKIP"):
+		return ArbitrateSkip
 	default:
-		return "background"
+		return ArbitrateKeepBoth
 	}
 }
 
-func (l *LLMClient) routeFromIntent(intent string) Route {
-	routes := map[string]Route{
-		"progress": {
-			DocTypes:       []string{"progress", "issue"},
-			MustLatest:     false,
-			TimeFilterDays: intPtr(3),
-			OrderBy:        "time_desc",
-		},
-		"decision": {
-			DocTypes:       []string{"architecture", "insight", "background", "dialogue_extract"},
-			MustLatest:     false,
-			TimeFilterDays: nil,
-			OrderBy:        "relevance",
-		},
-		"howto": {
-			DocTypes:       []string{"deployment", "delivery", "implementation"},
-			MustLatest:     true,
-			TimeFilterDays: nil,
-			OrderBy:        "relevance",
-		},
-		"debug": {
-			DocTypes:       []string{"issue", "progress", "insight"},
-			MustLatest:     false,
-			TimeFilterDays: nil,
-			OrderBy:        "relevance",
-		},
-		"background": {
-			DocTypes:       []string{"background", "architecture"},
-			MustLatest:     false,
-			TimeFilterDays: nil,
-			OrderBy:        "relevance",
-		},
+// mockArbitrate 简单规则判断（测试用）
+func mockArbitrate(newSummary, oldSummary string) ArbitrateResult {
+	// 完全相同 -> SKIP
+	if strings.TrimSpace(newSummary) == strings.TrimSpace(oldSummary) {
+		return ArbitrateSkip
 	}
-	if route, ok := routes[intent]; ok {
-		return route
+	// 有较多重叠 -> REPLACE（简化判断）
+	newWords := strings.Fields(newSummary)
+	oldWords := strings.Fields(oldSummary)
+	if len(newWords) == 0 || len(oldWords) == 0 {
+		return ArbitrateKeepBoth
 	}
-	return routes["background"]
+	overlap := 0
+	oldSet := make(map[string]bool)
+	for _, w := range oldWords {
+		oldSet[w] = true
+	}
+	for _, w := range newWords {
+		if oldSet[w] {
+			overlap++
+		}
+	}
+	overlapRatio := float64(overlap) / float64(len(newWords))
+	if overlapRatio > 0.5 {
+		return ArbitrateReplace
+	}
+	return ArbitrateKeepBoth
 }
 
-func (l *LLMClient) mockDistill(content string) DistillResult {
-	return DistillResult{
-		Summary:      "对话提炼(模拟)",
-		InsightType:  "solution",
-		Problem:      "",
-		Thinking:     []string{},
-		Solution:     truncate(content, 2000),
-		Result:       []string{},
-		Reproducible: false,
-		ApplicableTo: []string{},
-		Tags:         []string{},
+func fallbackTags(content string) []string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return []string{}
 	}
-}
-
-func (l *LLMClient) fallbackDistill(raw string) DistillResult {
-	return DistillResult{
-		Summary:      "对话提炼失败",
-		InsightType:  "solution",
-		Problem:      "",
-		Thinking:     []string{},
-		Solution:     truncate(raw, 2000),
-		Result:       []string{},
-		Reproducible: false,
-		ApplicableTo: []string{},
-		Tags:         []string{},
+	candidates := strings.FieldsFunc(trimmed, func(r rune) bool {
+		return !(unicode.IsLetter(r) || unicode.IsNumber(r))
+	})
+	var tags []string
+	for _, item := range candidates {
+		item = strings.TrimSpace(item)
+		if len([]rune(item)) < 2 {
+			continue
+		}
+		tags = append(tags, item)
+		if len(tags) >= 10 {
+			break
+		}
 	}
+	return normalizeTags(tags)
 }
 
-func buildDistillPrompt(content, projectID string) string {
-	return `你是资深技术负责人。以下是项目 ` + projectID + ` 的对话记录，请忽略寒暄和试错，提炼出结构化干货。
-
-重要约束：仅基于提供的对话内容作答。严禁编造原文未提及的细节（如版本号、协议细节等）。如果原文未提及，请留空。
-
-请输出严格 JSON，格式如下：
-{
-  "summary": "一句话摘要",
-  "insight_type": "solution|lesson|pattern|decision",
-  "problem": "问题/挑战",
-  "thinking": ["思考要点1", "思考要点2"],
-  "solution": "最终方案",
-  "result": ["结果1", "结果2"],
-  "reproducible": true,
-  "applicable_to": ["场景A", "场景B"],
-  "tags": ["标签1", "标签2"]
+func fallbackQueryKeywords(query string, max int) []string {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return []string{}
+	}
+	normalized := normalizeQuery(query)
+	if normalized == "" {
+		return []string{query}
+	}
+	parts := strings.Fields(normalized)
+	if max <= 0 {
+		max = 6
+	}
+	if len(parts) > max {
+		parts = parts[:max]
+	}
+	return normalizeTags(parts)
 }
 
-对话内容：
-` + truncate(content, 15000)
+func limitTags(tags []string, max int) []string {
+	if max <= 0 || len(tags) <= max {
+		return tags
+	}
+	return tags[:max]
 }
 
 func truncate(value string, limit int) string {

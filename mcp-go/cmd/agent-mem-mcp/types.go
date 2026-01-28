@@ -1,81 +1,188 @@
 package main
 
-import (
-	"time"
+import "time"
 
-	"github.com/pgvector/pgvector-go"
-)
-
-type WriteMemoryInput struct {
-	ProjectRoot   string   `json:"project_root" jsonschema:"description=项目根目录"`
-	RelativePath  string   `json:"relative_path,omitempty" jsonschema:"description=相对路径，可选"`
-	Content       string   `json:"content" jsonschema:"description=Markdown 内容"`
-	KnowledgeType string   `json:"knowledge_type,omitempty" jsonschema:"description=doc/insight/dialogue_extract"`
-	InsightType   string   `json:"insight_type,omitempty" jsonschema:"description=solution/lesson/pattern/decision"`
-	Tags          []string `json:"tags,omitempty" jsonschema:"description=标签"`
-	Overwrite     bool     `json:"overwrite,omitempty" jsonschema:"description=覆盖已有文件"`
+type IngestMemoryInput struct {
+	OwnerID     string `json:"owner_id"`
+	ProjectKey  string `json:"project_key"`
+	ProjectName string `json:"project_name"`
+	MachineName string `json:"machine_name"`
+	ProjectPath string `json:"project_path"`
+	ContentType string `json:"content_type"`
+	Content     string `json:"content"`
+	Ts          int64  `json:"ts"`
 }
 
-type WriteMemoryOutput struct {
-	Status       string `json:"status"`
-	FilePath     string `json:"file_path,omitempty"`
-	RelativePath string `json:"relative_path,omitempty"`
-	ProjectID    string `json:"project_id,omitempty"`
-	IngestStatus string `json:"ingest_status,omitempty"`
-	Reason       string `json:"reason,omitempty"`
+type IngestMemoryOutput struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Ts     int64  `json:"ts"`
 }
 
 type SearchInput struct {
-	Query          string   `json:"query" jsonschema:"description=检索问题"`
-	ProjectID      string   `json:"project_id,omitempty"`
-	DocTypes       []string `json:"doc_types,omitempty"`
-	KnowledgeTypes []string `json:"knowledge_types,omitempty"`
-	Limit          *int     `json:"limit,omitempty"`
-	UseRouting     *bool    `json:"use_routing,omitempty"`
-	UseRerank      *bool    `json:"use_rerank,omitempty"`
+	OwnerID     string `json:"owner_id"`
+	ProjectKey  string `json:"project_key"`
+	ProjectName string `json:"project_name"`
+	MachineName string `json:"machine_name"`
+	ProjectPath string `json:"project_path"`
+	Query       string `json:"query"`
+	Scope       string `json:"scope"`
+	Limit       int    `json:"limit"`
+}
+
+type SearchResult struct {
+	ID          string  `json:"id"`
+	Snippet     string  `json:"snippet"`
+	ContentType string  `json:"content_type"`
+	Score       float64 `json:"score"`
+	Ts          int64   `json:"ts"`
+	ChunkIndex  int     `json:"chunk_index"`
+	TotalChunks int     `json:"total_chunks"`
+}
+
+type SearchMetadata struct {
+	Total      int    `json:"total"`
+	Returned   int    `json:"returned"`
+	NextAction string `json:"next_action"`
+}
+
+type SearchResponse struct {
+	Results  []SearchResult `json:"results"`
+	Metadata SearchMetadata `json:"metadata"`
+}
+
+type GetMemoriesInput struct {
+	IDs []string `json:"ids"`
+}
+
+type MemoryRecord struct {
+	ID          string   `json:"id"`
+	Content     string   `json:"content"`
+	ContentType string   `json:"content_type"`
+	Summary     string   `json:"summary"`
+	Tags        []string `json:"tags"`
+	Ts          int64    `json:"ts"`
+}
+
+type GetMemoriesResponse struct {
+	Results []MemoryRecord `json:"results"`
 }
 
 type TimelineInput struct {
-	ProjectID string `json:"project_id,omitempty"`
-	AnchorID  string `json:"anchor_id,omitempty"`
-	Query     string `json:"query,omitempty"`
-	Days      *int   `json:"days,omitempty"`
-	Limit     *int   `json:"limit,omitempty"`
+	OwnerID     string `json:"owner_id"`
+	ProjectKey  string `json:"project_key"`
+	ProjectName string `json:"project_name"`
+	MachineName string `json:"machine_name"`
+	ProjectPath string `json:"project_path"`
+	Days        int    `json:"days"`
+	Limit       int    `json:"limit"`
 }
 
-type KnowledgeBlock struct {
-	ID                string           `json:"id"`
-	KnowledgeType     string           `json:"knowledge_type"`
-	DocType           string           `json:"doc_type,omitempty"`
-	InsightType       string           `json:"insight_type,omitempty"`
-	SourceType        string           `json:"source_type,omitempty"`
-	RawContentPath    string           `json:"raw_content_path,omitempty"`
-	ProjectID         string           `json:"project_id"`
-	ProjectName       string           `json:"project_name,omitempty"`
-	MachineID         string           `json:"machine_id,omitempty"`
-	FilePath          string           `json:"file_path"`
-	RelativePath      string           `json:"relative_path"`
-	FileHash          string           `json:"file_hash"`
-	Title             string           `json:"title"`
-	Content           string           `json:"content"`
-	Summary           string           `json:"summary,omitempty"`
-	StructuredContent any              `json:"structured_content,omitempty"`
-	CategoryL1        string           `json:"category_l1,omitempty"`
-	CategoryL2        string           `json:"category_l2,omitempty"`
-	CategoryL3        string           `json:"category_l3,omitempty"`
-	Tags              []string         `json:"tags,omitempty"`
-	Embedding         pgvector.Vector  `json:"embedding"`
-	RelatedIDs        any              `json:"related_ids,omitempty"`
-	Version           int              `json:"version"`
-	IsLatest          bool             `json:"is_latest"`
-	SupersededBy      string           `json:"superseded_by,omitempty"`
-	SupersedeReason   string           `json:"supersede_reason,omitempty"`
-	Status            string           `json:"status"`
-	DecayRule         string           `json:"decay_rule,omitempty"`
-	ExpiresAt         *time.Time       `json:"expires_at,omitempty"`
-	IsHighValue       bool             `json:"is_high_value"`
-	Reproducible      bool             `json:"reproducible"`
-	ApplicableTo      []string         `json:"applicable_to,omitempty"`
-	CreatedAt         time.Time        `json:"created_at"`
-	UpdatedAt         time.Time        `json:"updated_at"`
+type TimelineItem struct {
+	ID          string `json:"id"`
+	ContentType string `json:"content_type"`
+	Summary     string `json:"summary"`
+	Ts          int64  `json:"ts"`
+}
+
+type TimelineResponse struct {
+	Results  []TimelineItem `json:"results"`
+	Metadata SearchMetadata `json:"metadata"`
+}
+
+type ListProjectsInput struct {
+	OwnerID string `json:"owner_id"`
+	Limit   int    `json:"limit"`
+}
+
+type ProjectListItem struct {
+	OwnerID     string `json:"owner_id"`
+	ProjectKey  string `json:"project_key"`
+	MachineName string `json:"machine_name"`
+	ProjectPath string `json:"project_path"`
+	ProjectName string `json:"project_name"`
+	MemoryCount int    `json:"memory_count"`
+	LatestTs    int64  `json:"latest_ts"`
+}
+
+type ListProjectsResponse struct {
+	Results  []ProjectListItem `json:"results"`
+	Metadata SearchMetadata    `json:"metadata"`
+}
+
+type MemoryInsert struct {
+	ID           string
+	ProjectID    string
+	ContentType  string
+	Content      string
+	ContentHash  string
+	Ts           int64
+	Summary      string
+	Tags         []string
+	ChunkCount   int
+	Embedded     bool
+	AvgEmbedding []float32
+	CreatedAt    time.Time
+}
+
+type MemorySnapshot struct {
+	ID           string
+	ProjectID    string
+	ContentType  string
+	Content      string
+	ContentHash  string
+	Ts           int64
+	Summary      string
+	Tags         []string
+	ChunkCount   int
+	AvgEmbedding []float32
+	CreatedAt    time.Time
+}
+
+type MemoryVersionInsert struct {
+	MemoryID     string
+	ProjectID    string
+	ContentType  string
+	Content      string
+	ContentHash  string
+	Ts           int64
+	Summary      string
+	Tags         []string
+	ChunkCount   int
+	AvgEmbedding []float32
+	CreatedAt    time.Time
+	ReplacedAt   time.Time
+}
+
+type ArbitrationLogInsert struct {
+	OwnerID           string
+	ProjectID         string
+	CandidateMemoryID string
+	NewMemoryID       string
+	Action            string
+	Similarity        float64
+	OldSummary        string
+	NewSummary        string
+	Model             string
+	CreatedAt         time.Time
+}
+
+type FragmentInsert struct {
+	ID         string
+	MemoryID   string
+	ChunkIndex int
+	Content    string
+	Embedding  []float32
+}
+
+type FragmentRow struct {
+	FragmentID  string
+	MemoryID    string
+	ChunkIndex  int
+	Content     string
+	ContentType string
+	Ts          int64
+	ChunkCount  int
+	Distance    float64
+	RankScore   float64
 }

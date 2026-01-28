@@ -16,7 +16,8 @@ func main() {
 		port      = flag.Int("port", defaultPort, "监听端口")
 		transport = flag.String("transport", "http", "传输方式：http/sse/streamable/stdio")
 		config    = flag.String("config", "", "配置文件路径")
-		watchMode = flag.Bool("watch", false, "启动文件监控模式")
+		resetDB   = flag.Bool("reset-db", false, "重建数据库表结构（清空数据）")
+		resetOnly = flag.Bool("reset-only", false, "仅执行数据库重建/迁移后退出")
 	)
 	flag.Parse()
 
@@ -31,28 +32,11 @@ func main() {
 	}
 	defer app.Close()
 
-	if err := app.EnsureSchema(context.Background()); err != nil {
+	if err := app.EnsureSchema(context.Background(), *resetDB); err != nil {
 		panic(err)
 	}
-
-	if *watchMode {
-		fmt.Printf("🚀 启动 Watcher 模式\n")
-		watcher, err := NewWatcher(app)
-		if err != nil {
-			panic(err)
-		}
-		defer watcher.Close()
-
-		roots := settings.Watcher.Roots
-		roots = append(roots, settings.Watcher.ExtraRoots...)
-		if len(roots) == 0 {
-			roots = []string{"."}
-		}
-
-		watcher.Start(roots)
-
-		// 阻塞
-		select {}
+	if *resetOnly {
+		return
 	}
 
 	server := buildServer(app)
@@ -79,10 +63,12 @@ func main() {
 		streamHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
 		mux.Handle("/mcp", streamHandler)
 	}
+	registerHTTPRoutes(mux, app)
 
 	addr := fmt.Sprintf("%s:%d", *host, *port)
 	fmt.Printf("MCP 服务启动: http://%s\n", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	handler := requireToken(mux, envOrDefault("AGENT_MEM_HTTP_TOKEN", ""))
+	if err := http.ListenAndServe(addr, handler); err != nil {
 		panic(err)
 	}
 }

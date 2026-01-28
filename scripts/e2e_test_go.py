@@ -1,176 +1,201 @@
+import json
 import os
-import time
-import shutil
-import subprocess
 import signal
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
-from sqlalchemy import delete, select
-from src.db import get_db, KnowledgeBlock
-from src.core.searcher import Searcher
 
-# 定义测试项目配置
-PROJECT_ID = "e2e_test_go_watcher"
-MACHINE_ID = "test-host-go"
-ROOT_DIR = Path("tmp/e2e_test_env_go")
+BASE_URL = "http://127.0.0.1:8787"
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://cortex:cortex_password_secure@localhost:5440/cortex_knowledge",
+)
+GO_WORKDIR = Path(__file__).resolve().parent.parent / "mcp-go"
 
-# 模拟的测试文档内容
-MOCK_DOCS = {
-    "docs/architecture/system_design.md": "# System Architecture (Go Version)\n\n## Overview\nThe system has been migrated to pure Go.\n1. **Watcher**: Uses fsnotify.\n2. **Ingester**: Pure Go implementation of the pipeline.\n",
-    "insights/go_migration_lessons.md": "---\nknowledge_type: insight\ninsight_type: lesson\ntags: [golang, migration]\n---\n# Go Migration Lessons\n\n- **Problem**: Python dependency management is slow.\n- **Solution**: Rewrite in Go.\n- **Result**: Single binary, fast startup.\n"
-}
+MACHINE_NAME = "test-machine"
+PROJECT_PATH = "/tmp/agent-mem-e2e"
 
-def setup_env():
-    """准备测试环境"""
-    print(f"🛠️  Preparing environment: {ROOT_DIR}")
-    if ROOT_DIR.exists():
-        shutil.rmtree(ROOT_DIR)
-    ROOT_DIR.mkdir(parents=True)
-    
-    # 预先创建所有目录
-    print("📁 Creating directories...")
-    for rel_path in MOCK_DOCS.keys():
-        path = ROOT_DIR / rel_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        print(f"   Created: {path.parent}")
-
-    # 创建项目标识
-    (ROOT_DIR / ".project.yaml").write_text(f"project_id: {PROJECT_ID}\nproject_name: Go E2E测试", encoding="utf-8")
-    
-    # 清理数据库
-    print("🧹 Cleaning DB...")
-    db = next(get_db())
-    try:
-        db.execute(delete(KnowledgeBlock).where(KnowledgeBlock.project_id == PROJECT_ID))
-        db.commit()
-    finally:
-        db.close()
-
-def start_go_watcher():
-    """启动 Go Watcher"""
-    print("\n🚀 Starting Go Watcher...")
-    
-    # 构造配置文件
-    config_path = ROOT_DIR / "settings.yaml"
-    config_content = f"""
-project:
-  default_project_id: {PROJECT_ID}
-watcher:
-  roots: ["{ROOT_DIR.absolute()}"]
-  watch_dirs: ["docs", "insights"]
-  extensions: [".md"]
-  debounce_seconds: 1
-storage:
-  database_url: postgresql://cortex:cortex_password_secure@localhost:5440/cortex_knowledge
-llm:
-  api_key_env: DASHSCOPE_API_KEY
-  model_distill: qwen-plus
-  model_summary: qwen-turbo
-  model_relation: qwen-turbo
-  model_arbitrate: qwen-flash
-embedding:
-  provider: qwen
-  model: text-embedding-v4
+CONTENT_V1 = """# 数据库选型
+我们决定使用 PostgreSQL + pgvector 作为主存储。
+原因：
+1. 支持向量检索
+2. 生态成熟
 """
-    config_path.write_text(config_content, encoding="utf-8")
 
-    # 启动进程
-    cmd = [
-        "./out/agent-mem-mcp",
-        "--watch",
-        "--config", str(config_path.absolute())
-    ]
-    
-    # 设置环境变量
+CONTENT_V2 = """# 数据库选型
+最终采用 PostgreSQL + pgvector 作为主存储。
+原因：
+1. 支持向量检索
+2. 生态成熟
+3. 便于扩展
+"""
+
+
+def http_request(method, path, params=None, body=None, timeout=10):
+    url = BASE_URL + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    data = None
+    headers = {}
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.status, response.read().decode("utf-8")
+
+
+def start_server():
     env = os.environ.copy()
-    env["HOST_ID"] = MACHINE_ID
-    
+    env["AGENT_MEM_LLM_MODE"] = "mock"
+    env["AGENT_MEM_EMBEDDING_PROVIDER"] = "mock"
+    env["DATABASE_URL"] = DATABASE_URL
+    cmd = [
+        "go",
+        "run",
+        "./cmd/agent-mem-mcp",
+        "--reset-db",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8787",
+    ]
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         env=env,
-        preexec_fn=os.setsid
+        cwd=str(GO_WORKDIR),
+        preexec_fn=os.setsid,
     )
-    
-    # 等待启动
-    print("   ... Waiting for watcher to start (3s) ...")
-    time.sleep(3)
-    if process.poll() is not None:
-        stdout, stderr = process.communicate()
-        print(f"❌ Watcher failed to start:\nSTDOUT: {stdout}\nSTDERR: {stderr}")
-        return None
-        
-    print("✅ Watcher started")
-    return process
 
-def write_files():
-    """写入文件触发 Watcher"""
-    print("\n📝 Writing test docs...")
-    for rel_path, content in MOCK_DOCS.items():
-        file_path = ROOT_DIR / rel_path
-        print(f"   + Writing {rel_path}")
-        try:
-            file_path.write_text(content.strip(), encoding="utf-8")
-        except Exception as e:
-            print(f"❌ Write failed: {e}")
+    for _ in range(12):
         time.sleep(1)
+        try:
+            status, _ = http_request(
+                "GET",
+                "/projects",
+                params={"machine_name": MACHINE_NAME, "limit": 1},
+                timeout=2,
+            )
+            if status == 200:
+                return process
+        except Exception:
+            continue
 
-def run_db_verification():
-    """验证数据库"""
-    print("\n📊 Verifying DB...")
-    
-    max_retries = 10
-    db = next(get_db())
-    
+    print("❌ 服务启动失败")
+    stop_server(process)
+    return None
+
+
+def stop_server(process):
+    if not process:
+        return
     try:
-        for i in range(max_retries):
-            time.sleep(2)
-            count = db.execute(
-                select(KnowledgeBlock).where(KnowledgeBlock.project_id == PROJECT_ID)
-            ).scalars().all()
-            print(f"   [{i+1}/{max_retries}] Records: {len(count)} (Expected: {len(MOCK_DOCS)})")
-            
-            if len(count) >= len(MOCK_DOCS):
-                print("✅ Success: All records found")
-                
-                # 验证 Insight
-                insights = db.execute(
-                    select(KnowledgeBlock).where(
-                        KnowledgeBlock.project_id == PROJECT_ID,
-                        KnowledgeBlock.knowledge_type == 'insight'
-                    )
-                ).scalars().all()
-                print(f"   Insights found: {len(insights)}")
-                if len(insights) > 0:
-                    print(f"   - Insight Title: {insights[0].title}")
-                return True
-        
-        print("❌ Timeout: Missing records")
-        return False
-    finally:
-        db.close()
-
-def stop_watcher(process):
-    if process:
-        print("\n🛑 Stopping Watcher...")
         os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-        process.wait()
-        # 打印日志
-        stdout, stderr = process.communicate()
-        print("--- Watcher Logs ---")
+    except ProcessLookupError:
+        return
+    stdout, stderr = process.communicate(timeout=5)
+    if stdout:
+        print("--- STDOUT ---")
         print(stdout)
+    if stderr:
+        print("--- STDERR ---")
         print(stderr)
-        print("--------------------")
+
+
+def ingest(content):
+    payload = {
+        "machine_name": MACHINE_NAME,
+        "project_path": PROJECT_PATH,
+        "content_type": "development",  # 新分类：requirement|plan|development|testing|insight
+        "content": content,
+        "ts": int(time.time()),
+    }
+    status, body = http_request("POST", "/ingest/memory", body=payload)
+    data = json.loads(body)
+    return status, data
+
+
+def main():
+    print("🚀 启动 Go 服务...")
+    server = start_server()
+    if not server:
+        sys.exit(1)
+
+    try:
+        print("\n[1] 初次写入")
+        status, data = ingest(CONTENT_V1)
+        print(status, data)
+        if status != 200 or data.get("status") != "created":
+            print("❌ 初次写入失败")
+            sys.exit(1)
+
+        print("\n[2] 相同内容重复写入")
+        status, data = ingest(CONTENT_V1)
+        print(status, data)
+        # LLM 仲裁：完全相同内容应返回 skipped（mock 向量可能不命中，返回 created 也允许）
+        if status != 200:
+            print("❌ 重复写入请求失败")
+            sys.exit(1)
+        if data.get("status") not in ("skipped", "created"):
+            print(f"⚠️ 重复内容状态: {data.get('status')}（预期 skipped 或 created）")
+
+        print("\n[3] 语义更新")
+        status, data = ingest(CONTENT_V2)
+        print(status, data)
+        if status != 200:
+            print("❌ 语义更新失败")
+            sys.exit(1)
+        if data.get("status") not in ("updated", "created"):
+            print("❌ 语义更新状态异常")
+            sys.exit(1)
+        if data.get("status") == "created":
+            print("⚠️ 语义更新未命中（mock 向量下允许）")
+
+        print("\n[4] 语义检索")
+        status, body = http_request(
+            "GET",
+            "/memories/search",
+            params={
+                "machine_name": MACHINE_NAME,
+                "project_path": PROJECT_PATH,
+                "query": "为什么选择 PostgreSQL",
+                "scope": "development",  # 新分类
+                "limit": 5,
+            },
+        )
+        print(status, body)
+        if status != 200:
+            print("❌ 检索失败")
+            sys.exit(1)
+        search_data = json.loads(body)
+        results = search_data.get("results", [])
+        if not results:
+            print("❌ 检索无结果")
+            sys.exit(1)
+
+        memory_id = results[0]["id"]
+
+        print("\n[5] 获取完整内容")
+        status, body = http_request("GET", "/memories", params={"ids": memory_id})
+        print(status, body)
+        if status != 200:
+            print("❌ 获取失败")
+            sys.exit(1)
+        get_data = json.loads(body)
+        if not get_data.get("results"):
+            print("❌ 获取无结果")
+            sys.exit(1)
+
+        print("\n✅ E2E 测试完成")
+    finally:
+        stop_server(server)
+
 
 if __name__ == "__main__":
-    setup_env()
-    watcher_proc = start_go_watcher()
-    if watcher_proc:
-        try:
-            write_files()
-            success = run_db_verification()
-            if not success:
-                exit(1)
-        finally:
-            stop_watcher(watcher_proc)
+    main()

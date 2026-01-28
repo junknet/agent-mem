@@ -13,33 +13,26 @@ const (
 	defaultHost      = "127.0.0.1"
 	defaultPort      = 8787
 	defaultProjectID = "global"
+	defaultOwnerID   = "personal"
 )
 
 type Settings struct {
-	Project    ProjectConfig    `yaml:"project"`
-	Watcher    WatcherConfig    `yaml:"watcher"`
-	Versioning VersioningConfig `yaml:"versioning"`
-	LLM        LLMConfig        `yaml:"llm"`
-	Embedding  EmbeddingConfig  `yaml:"embedding"`
-	Rerank     RerankConfig     `yaml:"rerank"`
-	Storage    StorageConfig    `yaml:"storage"`
+	Project     ProjectConfig     `yaml:"project"`
+	Versioning  VersioningConfig  `yaml:"versioning"`
+	LLM         LLMConfig         `yaml:"llm"`
+	Embedding   EmbeddingConfig   `yaml:"embedding"`
+	Rerank      RerankConfig      `yaml:"rerank"`
+	QueryExpand QueryExpandConfig `yaml:"query_expansion"`
+	Chunking    ChunkingConfig    `yaml:"chunking"`
+	Storage     StorageConfig     `yaml:"storage"`
 }
 
 type ProjectConfig struct {
+	OwnerID          string   `yaml:"owner_id"`
 	RootMarkers      []string `yaml:"root_markers"`
 	ProjectIDKey     string   `yaml:"project_id_key"`
 	ProjectNameKey   string   `yaml:"project_name_key"`
 	DefaultProjectID string   `yaml:"default_project_id"`
-}
-
-type WatcherConfig struct {
-	Roots         []string `yaml:"roots"`
-	MaxFileSizeKB int      `yaml:"max_file_size_kb"`
-	WatchDirs     []string `yaml:"watch_dirs"`
-	WatchRoot     []string `yaml:"watch_root_files"`
-	Extensions    []string `yaml:"extensions"`
-	IgnoreDirs    []string `yaml:"ignore_dirs"`
-	ExtraRoots    []string `yaml:"extra_roots"`
 }
 
 type VersioningConfig struct {
@@ -70,6 +63,19 @@ type RerankConfig struct {
 	TopN    int    `yaml:"top_n"`
 }
 
+type QueryExpandConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	Model       string `yaml:"model"`
+	MaxKeywords int    `yaml:"max_keywords"`
+}
+
+type ChunkingConfig struct {
+	Strategy            string `yaml:"strategy"`
+	ChunkSize           int    `yaml:"chunk_size"`
+	Overlap             int    `yaml:"overlap"`
+	ApproxCharsPerToken int    `yaml:"approx_chars_per_token"`
+}
+
 type StorageConfig struct {
 	DatabaseURL string `yaml:"database_url"`
 }
@@ -77,24 +83,11 @@ type StorageConfig struct {
 func defaultSettings() Settings {
 	return Settings{
 		Project: ProjectConfig{
+			OwnerID:          defaultOwnerID,
 			RootMarkers:      []string{".git", ".project.yaml", "package.json", "pyproject.toml", "Cargo.toml", "go.mod"},
 			ProjectIDKey:     "project_id",
 			ProjectNameKey:   "project_name",
 			DefaultProjectID: defaultProjectID,
-		},
-		Watcher: WatcherConfig{
-			Roots:         []string{},
-			MaxFileSizeKB: 2048,
-			WatchDirs: []string{
-				"docs", "doc", "specs", "requirements", "progress", "notes", "design",
-				"architecture", "insights", "lessons", "postmortem", "chat_history",
-			},
-			WatchRoot: []string{
-				"README.md", "README.txt", "TASKS.md", "CHANGELOG.md", "TODO.md", "NOTES.md", "DESIGN.md", "ARCHITECTURE.md",
-			},
-			Extensions: []string{".md", ".txt", ".rst", ".adoc", ".org", ".yaml", ".yml", ".json"},
-			IgnoreDirs: []string{".git", "node_modules", "__pycache__", ".venv", "venv", "env", "dist", "build", "target", ".idea", ".vscode", ".pytest_cache"},
-			ExtraRoots: []string{},
 		},
 		Versioning: VersioningConfig{
 			SemanticSimilarityThreshold: 0.85,
@@ -109,9 +102,20 @@ func defaultSettings() Settings {
 			ModelArbitrate: "qwen-flash",
 			ModelSummary:   "qwen-turbo",
 		},
-		Embedding: EmbeddingConfig{Provider: "qwen", Model: "text-embedding-v4", Dimension: 1024, BatchSize: 32},
+		Embedding: EmbeddingConfig{Provider: "qwen", Model: "text-embedding-v4", Dimension: 1536, BatchSize: 10},
 		Rerank:    RerankConfig{Enabled: false, Model: "gte-rerank-v2", TopN: 10},
-		Storage:   StorageConfig{DatabaseURL: "postgresql://cortex:cortex_password_secure@localhost:5440/cortex_knowledge"},
+		QueryExpand: QueryExpandConfig{
+			Enabled:     true,
+			Model:       "qwen-turbo",
+			MaxKeywords: 6,
+		},
+		Chunking: ChunkingConfig{
+			Strategy:            "fixed_tokens",
+			ChunkSize:           500,
+			Overlap:             50,
+			ApproxCharsPerToken: 4,
+		},
+		Storage: StorageConfig{DatabaseURL: "postgresql://cortex:cortex_password_secure@localhost:5440/cortex_knowledge"},
 	}
 }
 
@@ -133,6 +137,9 @@ func loadSettings(configPath string) (Settings, error) {
 	if envDB := os.Getenv("DATABASE_URL"); envDB != "" {
 		settings.Storage.DatabaseURL = envDB
 	}
+	if envOwner := os.Getenv("AGENT_MEM_OWNER_ID"); envOwner != "" {
+		settings.Project.OwnerID = envOwner
+	}
 	if envBase := os.Getenv("DASHSCOPE_BASE_URL"); envBase != "" {
 		settings.LLM.BaseURL = envBase
 	}
@@ -149,6 +156,9 @@ func loadSettings(configPath string) (Settings, error) {
 		if value, err := strconv.Atoi(envDim); err == nil && value > 0 {
 			settings.Embedding.Dimension = value
 		}
+	}
+	if strings.TrimSpace(settings.Project.OwnerID) == "" {
+		settings.Project.OwnerID = defaultOwnerID
 	}
 	settings.Storage.DatabaseURL = normalizeDatabaseURL(settings.Storage.DatabaseURL)
 	return settings, nil

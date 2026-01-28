@@ -2,649 +2,459 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
-	"os"
-	"path/filepath"
-	"regexp"
+	"errors"
+	"fmt"
+	"math"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/pgvector/pgvector-go"
-	"gopkg.in/yaml.v3"
 )
-
-type KnowledgeType string
-
-type DocType string
-
-type InsightType string
-
-type SourceType string
-
-type StatusType string
-
-type DecayRule string
-
-const (
-	KnowledgeTypeDoc             KnowledgeType = "doc"
-	KnowledgeTypeInsight         KnowledgeType = "insight"
-	KnowledgeTypeDialogueExtract KnowledgeType = "dialogue_extract"
-
-	SourceTypeFile     SourceType = "file"
-	SourceTypeDialogue SourceType = "dialogue"
-
-	StatusActive     StatusType = "active"
-	StatusDeprecated StatusType = "deprecated"
-	StatusConflict   StatusType = "conflict"
-
-	DecayNone        DecayRule = "none"
-	DecayTime30Days  DecayRule = "time_30d"
-	DecayVersionOnly DecayRule = "version_only"
-)
-
-type KnowledgeIngest struct {
-	ProjectID      string
-	ProjectName    string
-	MachineID      string
-	FilePath       string
-	RelativePath   string
-	RawContentPath string
-	FileHash       string
-	Title          string
-	Content        string
-	Summary        string
-	Structured     map[string]any
-	KnowledgeType  KnowledgeType
-	DocType        DocType
-	InsightType    InsightType
-	SourceType     SourceType
-	CategoryL1     string
-	CategoryL2     string
-	CategoryL3     string
-	Tags           []string
-	RelatedIDs     []map[string]any
-	DecayRule      DecayRule
-	IsHighValue    bool
-	Reproducible   *bool
-	ApplicableTo   []string
-}
 
 type IngestResult struct {
-	Status string
-	Reason string
 	ID     string
+	Status string
 }
 
-type ProjectMeta struct {
-	ProjectID   string
-	ProjectName string
-	RootPath    string
-}
+const defaultSemanticUpdateCandidates = 20
 
-var docTypeRules = []struct {
-	Pattern *regexp.Regexp
-	Type    DocType
-}{
-	{regexp.MustCompile(`docs/background/`), DocType("background")},
-	{regexp.MustCompile(`docs/requirements?/`), DocType("requirements")},
-	{regexp.MustCompile(`docs/arch(itecture)?/`), DocType("architecture")},
-	{regexp.MustCompile(`docs/design/`), DocType("design")},
-	{regexp.MustCompile(`docs/implementation/`), DocType("implementation")},
-	{regexp.MustCompile(`docs/progress/`), DocType("progress")},
-	{regexp.MustCompile(`docs/testing/`), DocType("testing")},
-	{regexp.MustCompile(`docs/deploy(ment)?/`), DocType("deployment")},
-	{regexp.MustCompile(`docs/delivery/`), DocType("delivery")},
-}
-
-var rootFileRules = map[string]DocType{
-	"readme.md":       DocType("delivery"),
-	"tasks.md":        DocType("progress"),
-	"changelog.md":    DocType("progress"),
-	"todo.md":         DocType("progress"),
-	"notes.md":        DocType("progress"),
-	"design.md":       DocType("architecture"),
-	"architecture.md": DocType("architecture"),
-}
-
-var insightPathRules = []struct {
-	Pattern *regexp.Regexp
-	Type    InsightType
-}{
-	{regexp.MustCompile(`insights?/`), InsightType("pattern")},
-	{regexp.MustCompile(`lessons?/`), InsightType("lesson")},
-	{regexp.MustCompile(`postmortem/`), InsightType("lesson")},
-}
-
-var dialogueRules = []*regexp.Regexp{
-	regexp.MustCompile(`chat_history/`),
-	regexp.MustCompile(`\.claude/`),
-	regexp.MustCompile(`\.codex/`),
-	regexp.MustCompile(`\.gemini/`),
-}
-
-var decayRules = map[string]DecayRule{
-	"progress":   DecayTime30Days,
-	"deployment": DecayVersionOnly,
-	"delivery":   DecayVersionOnly,
-}
-
-func ingestFile(ctx context.Context, app *App, filePath, projectRoot, machineID string) (IngestResult, error) {
-	data, err := processFile(app.settings, filePath, projectRoot, machineID)
+func (a *App) IngestMemory(ctx context.Context, input IngestMemoryInput) (IngestResult, error) {
+	normalized, err := normalizeIngestInput(input, a.settings, time.Now().UTC())
 	if err != nil {
 		return IngestResult{}, err
 	}
-	if data == nil {
-		return IngestResult{Status: "skipped", Reason: "文件不在监控范围或为空"}, nil
-	}
-
-	existing, err := app.store.FindLatestByRelativePath(ctx, data.ProjectID, data.RelativePath)
-	if err != nil {
+	if err := validateIngestInput(normalized); err != nil {
 		return IngestResult{}, err
 	}
-	if existing != nil && existing.FileHash == data.FileHash {
-		return IngestResult{Status: "skipped", Reason: "未变化"}, nil
+	input = normalized
+
+	project, err := a.store.UpsertProject(ctx, input.OwnerID, input.ProjectKey, input.ProjectName, input.MachineName, input.ProjectPath)
+	if err != nil {
+		return IngestResult{}, fmt.Errorf("项目写入失败: %w", err)
 	}
 
-	if data.SourceType == SourceTypeDialogue {
-		distilled := app.llm.DistillDialogue(data.Content, data.ProjectID)
-		data.Summary = distilled.Summary
-		data.KnowledgeType = KnowledgeTypeDialogueExtract
-		if isValidInsightType(distilled.InsightType) {
-			data.InsightType = InsightType(distilled.InsightType)
+	contentHash := hashContent(input.Content)
+
+	summary := a.llm.Summarize(input.Content)
+	if summary == "" {
+		summary = fallbackSummary(input.Content)
+	}
+	tags := a.llm.ExtractTags(input.Content)
+
+	chunks := chunkContent(input.Content, a.settings.Chunking)
+	if len(chunks) == 0 {
+		return IngestResult{}, errors.New("内容切分失败")
+	}
+
+	embeddings, err := a.embedder.EmbedBatch(ctx, chunks)
+	if err != nil {
+		return IngestResult{}, fmt.Errorf("向量化失败: %w", err)
+	}
+	if len(embeddings) != len(chunks) {
+		return IngestResult{}, errors.New("向量数量与片段数量不一致")
+	}
+
+	// 计算 memory 级别的平均向量（用于冲突检测和存储）
+	avgVector := averageEmbedding(embeddings, a.embedder.dimension)
+	avgVector = l2Normalize(avgVector)
+
+	// 两层冲突检测：向量粗筛 + LLM 仲裁
+	var action ArbitrateResult = ArbitrateKeepBoth // 默认新建
+	semanticTargetID := ""
+	semanticSimilarity := 0.0
+	oldSummary := ""
+
+	if len(avgVector) > 0 {
+		threshold := semanticUpdateThreshold(a.settings.Versioning.SemanticSimilarityThreshold)
+		vector := pgvector.NewVector(avgVector)
+
+		// 第一层：向量粗筛（只按项目过滤，不按类型）
+		candidateID, similarity, err := findSemanticUpdateCandidate(ctx, a.store, vector, project.ID, threshold, defaultSemanticUpdateCandidates)
+		if err != nil {
+			return IngestResult{}, fmt.Errorf("语义更新候选查找失败: %w", err)
 		}
-		data.Structured = map[string]any{
-			"problem":  distilled.Problem,
-			"thinking": distilled.Thinking,
-			"solution": distilled.Solution,
-			"result":   distilled.Result,
+
+		// 第二层：LLM 仲裁（仅当向量相似度超过阈值时）
+		if candidateID != "" && similarity >= threshold {
+			semanticSimilarity = similarity
+			semanticTargetID = candidateID
+			// 获取旧摘要
+			oldMemory, err := a.store.FetchMemorySummary(ctx, candidateID)
+			if err == nil && oldMemory.Summary != "" {
+				oldSummary = oldMemory.Summary
+				// LLM 仲裁：比较新旧摘要
+				action = a.llm.Arbitrate(summary, oldMemory.Summary)
+			} else {
+				// 获取旧摘要失败，保守处理：替换
+				action = ArbitrateReplace
+			}
 		}
-		if distilled.Solution != "" {
-			data.Content = distilled.Solution
+	}
+
+	memoryID := newMemoryID()
+	if (action == ArbitrateReplace || action == ArbitrateSkip) && semanticTargetID != "" {
+		memoryID = semanticTargetID
+	}
+
+	if action == ArbitrateSkip {
+		if semanticTargetID != "" {
+			_ = a.store.InsertArbitrationLog(ctx, ArbitrationLogInsert{
+				OwnerID:           input.OwnerID,
+				ProjectID:         project.ID,
+				CandidateMemoryID: semanticTargetID,
+				NewMemoryID:       memoryID,
+				Action:            string(action),
+				Similarity:        semanticSimilarity,
+				OldSummary:        oldSummary,
+				NewSummary:        summary,
+				Model:             a.settings.LLM.ModelArbitrate,
+				CreatedAt:         time.Now().UTC(),
+			})
 		}
-		data.IsHighValue = true
-		data.Tags = mergeTags(data.Tags, distilled.Tags)
-		data.Reproducible = &distilled.Reproducible
-		data.ApplicableTo = distilled.ApplicableTo
-		data.RawContentPath = data.FilePath
+		return IngestResult{ID: memoryID, Status: "skipped"}, nil
 	}
 
-	if data.Summary == "" && len(data.Content) > 800 {
-		data.Summary = app.llm.Summarize(data.Content)
+	memory := MemoryInsert{
+		ID:           memoryID,
+		ProjectID:    project.ID,
+		ContentType:  input.ContentType,
+		Content:      input.Content,
+		ContentHash:  contentHash,
+		Ts:           input.Ts,
+		Summary:      summary,
+		Tags:         tags,
+		ChunkCount:   len(chunks),
+		Embedded:     true,
+		AvgEmbedding: avgVector,
+		CreatedAt:    time.Now().UTC(),
 	}
 
-	data.RelatedIDs = resolveRelations(ctx, app, data.Content, data.ProjectID)
-
-	vector, err := app.embedder.EmbedQuery(data.SummaryOrContent())
+	tx, err := a.store.pool.Begin(ctx)
 	if err != nil {
-		return IngestResult{}, err
-	}
-
-	id := newID()
-	version := 1
-	if existing != nil {
-		version = existing.Version + 1
-	}
-
-	now := time.Now().UTC()
-	expiresAt := calcExpiresAt(data.DecayRule, now)
-
-	structuredJSON, err := json.Marshal(data.Structured)
-	if err != nil {
-		return IngestResult{}, err
-	}
-	tagsJSON, err := json.Marshal(data.Tags)
-	if err != nil {
-		return IngestResult{}, err
-	}
-	relatedJSON, err := json.Marshal(data.RelatedIDs)
-	if err != nil {
-		return IngestResult{}, err
-	}
-	applicableJSON, err := json.Marshal(data.ApplicableTo)
-	if err != nil {
-		return IngestResult{}, err
-	}
-
-	tx, err := app.store.Begin(ctx)
-	if err != nil {
-		return IngestResult{}, err
+		return IngestResult{}, fmt.Errorf("事务开启失败: %w", err)
 	}
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
 
-	insert := `
-INSERT INTO knowledge (
-  id, knowledge_type, doc_type, insight_type, source_type, raw_content_path,
-  project_id, project_name, machine_id, file_path, relative_path, file_hash,
-  title, content, summary, structured_content, category_l1, category_l2, category_l3,
-  tags, embedding, related_ids, version, is_latest, superseded_by, supersede_reason,
-  status, decay_rule, expires_at, is_high_value, reproducible, applicable_to,
-  created_at, updated_at
-) VALUES (
-  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34
-)`
-
-	_, err = tx.Exec(ctx, insert,
-		id,
-		string(data.KnowledgeType),
-		nullableString(string(data.DocType)),
-		nullableString(string(data.InsightType)),
-		string(data.SourceType),
-		nullableString(data.RawContentPath),
-		data.ProjectID,
-		nullableString(data.ProjectName),
-		data.MachineID,
-		data.FilePath,
-		data.RelativePath,
-		data.FileHash,
-		data.Title,
-		data.Content,
-		nullableString(data.Summary),
-		nullableJSON(structuredJSON),
-		nullableString(data.CategoryL1),
-		nullableString(data.CategoryL2),
-		nullableString(data.CategoryL3),
-		nullableJSON(tagsJSON),
-		vector,
-		nullableJSON(relatedJSON),
-		version,
-		true,
-		nil,
-		nil,
-		string(StatusActive),
-		string(data.DecayRule),
-		nullableTime(expiresAt),
-		data.IsHighValue,
-		nullableBool(data.Reproducible),
-		nullableJSON(applicableJSON),
-		now,
-		now,
-	)
-	if err != nil {
-		return IngestResult{}, err
-	}
-
-	if existing != nil {
-		// 极客模式：同一文件更新，直接物理删除旧记录
-		if err := app.store.DeleteBlock(ctx, tx, existing.ID); err != nil {
-			return IngestResult{}, err
+	if action == ArbitrateReplace && semanticTargetID != "" {
+		if err := insertMemoryVersionFromMemoryTx(ctx, tx, memoryID); err != nil {
+			return IngestResult{}, fmt.Errorf("保存旧版本失败: %w", err)
+		}
+		if err := insertArbitrationLogTx(ctx, tx, ArbitrationLogInsert{
+			OwnerID:           input.OwnerID,
+			ProjectID:         project.ID,
+			CandidateMemoryID: semanticTargetID,
+			NewMemoryID:       memoryID,
+			Action:            string(action),
+			Similarity:        semanticSimilarity,
+			OldSummary:        oldSummary,
+			NewSummary:        summary,
+			Model:             a.settings.LLM.ModelArbitrate,
+			CreatedAt:         time.Now().UTC(),
+		}); err != nil {
+			return IngestResult{}, fmt.Errorf("记录仲裁日志失败: %w", err)
+		}
+		// 替换模式：更新旧记忆，删除旧片段
+		if err := updateMemoryTx(ctx, tx, memory); err != nil {
+			return IngestResult{}, fmt.Errorf("更新记忆失败: %w", err)
+		}
+		if err := deleteFragmentsTx(ctx, tx, memoryID); err != nil {
+			return IngestResult{}, fmt.Errorf("清理旧片段失败: %w", err)
 		}
 	} else {
-		// 新文件：检查语义冲突
-		if err := semanticReplace(ctx, app, tx, id, data, vector); err != nil {
-			return IngestResult{}, err
+		if semanticTargetID != "" {
+			if err := insertArbitrationLogTx(ctx, tx, ArbitrationLogInsert{
+				OwnerID:           input.OwnerID,
+				ProjectID:         project.ID,
+				CandidateMemoryID: semanticTargetID,
+				NewMemoryID:       memoryID,
+				Action:            string(action),
+				Similarity:        semanticSimilarity,
+				OldSummary:        oldSummary,
+				NewSummary:        summary,
+				Model:             a.settings.LLM.ModelArbitrate,
+				CreatedAt:         time.Now().UTC(),
+			}); err != nil {
+				return IngestResult{}, fmt.Errorf("记录仲裁日志失败: %w", err)
+			}
 		}
+		// 新建模式
+		if err := insertMemoryTx(ctx, tx, memory); err != nil {
+			return IngestResult{}, fmt.Errorf("写入记忆失败: %w", err)
+		}
+	}
+
+	fragments := make([]FragmentInsert, 0, len(chunks))
+	for idx, chunk := range chunks {
+		fragments = append(fragments, FragmentInsert{
+			ID:         newFragmentID(idx),
+			MemoryID:   memoryID,
+			ChunkIndex: idx,
+			Content:    chunk,
+			Embedding:  embeddings[idx],
+		})
+	}
+
+	if err := insertFragmentsTx(ctx, tx, fragments); err != nil {
+		return IngestResult{}, fmt.Errorf("写入片段失败: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return IngestResult{}, err
+		return IngestResult{}, fmt.Errorf("事务提交失败: %w", err)
 	}
 
-	return IngestResult{Status: "ok", ID: id}, nil
+	if action == ArbitrateReplace {
+		return IngestResult{ID: memoryID, Status: "updated"}, nil
+	}
+	return IngestResult{ID: memoryID, Status: "created"}, nil
 }
 
-func semanticReplace(ctx context.Context, app *App, tx pgx.Tx, newID string, data *KnowledgeIngest, vector pgvector.Vector) error {
-	candidates, err := app.store.SearchSimilar(ctx, vector, data.ProjectID, string(data.DocType), 3)
-	if err != nil {
-		return err
+func insertMemoryTx(ctx context.Context, tx pgxTx, memory MemoryInsert) error {
+	tagsJSON, _ := json.Marshal(memory.Tags)
+	var avgVec any
+	if len(memory.AvgEmbedding) > 0 {
+		avgVec = pgvector.NewVector(memory.AvgEmbedding)
 	}
-	threshold := app.settings.Versioning.SemanticSimilarityThreshold
-	for _, candidate := range candidates {
-		similarity, _ := candidate["similarity"].(float64)
-		if similarity < threshold {
-			continue
-		}
-		// 只有相似度够高，才进行 LLM 仲裁
-		decision := app.llm.ArbitrateConflict(data.Content, candidate["content"].(string))
-		switch decision {
-		case "replace":
-			// 极客模式：语义替代，直接物理删除旧记录
-			if err := app.store.DeleteBlock(ctx, tx, candidate["id"].(string)); err != nil {
-				return err
-			}
-		case "conflict":
-			// 冲突时保留旧的，标记为 conflict
-			if err := markSuperseded(ctx, tx, candidate["id"].(string), newID, StatusConflict, "conflict"); err != nil {
-				return err
-			}
-		default:
-			continue
-		}
-	}
-	return nil
-}
-
-func markSuperseded(ctx context.Context, tx pgx.Tx, oldID, newID string, status StatusType, reason string) error {
-	update := `UPDATE knowledge SET is_latest = false, superseded_by = $1, status = $2, supersede_reason = $3 WHERE id = $4`
-	_, err := tx.Exec(ctx, update, newID, string(status), reason, oldID)
+	_, err := tx.Exec(ctx, `
+INSERT INTO memories (
+  id, project_id, content_type, content, content_hash, ts,
+  summary, tags, chunk_count, embedding_done, avg_embedding
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11)`,
+		memory.ID,
+		memory.ProjectID,
+		memory.ContentType,
+		memory.Content,
+		memory.ContentHash,
+		memory.Ts,
+		nullableString(memory.Summary),
+		string(tagsJSON),
+		memory.ChunkCount,
+		memory.Embedded,
+		avgVec,
+	)
 	return err
 }
 
-func resolveRelations(ctx context.Context, app *App, content, projectID string) []map[string]any {
-	relations := app.llm.ExtractRelations(content)
-	var related []map[string]any
-	for _, rel := range relations {
-		if rel.Keyword == "" || rel.RelationType == "" {
-			continue
-		}
-		matches, err := app.store.SearchByKeyword(ctx, projectID, rel.Keyword, 1)
-		if err != nil || len(matches) == 0 {
-			continue
-		}
-		related = append(related, map[string]any{
-			"id":      matches[0]["id"],
-			"type":    rel.RelationType,
-			"keyword": rel.Keyword,
-		})
+func updateMemoryTx(ctx context.Context, tx pgxTx, memory MemoryInsert) error {
+	tagsJSON, _ := json.Marshal(memory.Tags)
+	if strings.TrimSpace(memory.ID) == "" {
+		return errors.New("记忆ID为空")
 	}
-	return related
-}
-
-func processFile(settings Settings, filePath, projectRoot, machineID string) (*KnowledgeIngest, error) {
-	info, err := os.Stat(filePath)
-	if err != nil || info.IsDir() {
-		return nil, nil
+	var avgVec any
+	if len(memory.AvgEmbedding) > 0 {
+		avgVec = pgvector.NewVector(memory.AvgEmbedding)
 	}
-	if settings.Watcher.MaxFileSizeKB > 0 && info.Size() > int64(settings.Watcher.MaxFileSizeKB)*1024 {
-		return nil, nil
-	}
-
-	rootPath := projectRoot
-	if rootPath == "" {
-		rootPath = findProjectRoot(settings, filePath)
-	}
-	if rootPath == "" {
-		rootPath = filepath.Dir(filePath)
-	}
-
-	relative := filePath
-	if rootPath != "" {
-		if rel, err := filepath.Rel(rootPath, filePath); err == nil {
-			relative = rel
-		}
-	}
-	relative = filepath.ToSlash(relative)
-
-	if !shouldWatchFile(settings, relative) && !isDialoguePath(relative) {
-		return nil, nil
-	}
-
-	content, err := readFileSafe(filePath)
-	if err != nil || strings.TrimSpace(content) == "" {
-		return nil, nil
-	}
-
-	front, body := parseFrontMatter(content)
-
-	projectMeta := loadProjectMeta(settings, rootPath)
-	docType := inferDocType(relative, front)
-	knowledgeType, insightType, sourceType := inferKnowledgeType(relative, front)
-
-	title := extractTitle(body, filepath.Base(relative))
-	fileHash := calculateFileHash(content)
-
-	cat1, cat2, cat3 := extractCategories(relative)
-
-	tags := []string{}
-	if rawTags, ok := front["tags"].([]any); ok {
-		for _, tag := range rawTags {
-			if value, ok := tag.(string); ok {
-				tags = append(tags, value)
-			}
-		}
-	}
-
-	decayRule := decayRules[string(docType)]
-	if decayRule == "" {
-		decayRule = DecayNone
-	}
-
-	return &KnowledgeIngest{
-		ProjectID:     projectMeta.ProjectID,
-		ProjectName:   projectMeta.ProjectName,
-		MachineID:     machineID,
-		FilePath:      filePath,
-		RelativePath:  filepath.ToSlash(relative),
-		FileHash:      fileHash,
-		Title:         title,
-		Content:       body,
-		KnowledgeType: knowledgeType,
-		DocType:       docType,
-		InsightType:   insightType,
-		SourceType:    sourceType,
-		CategoryL1:    cat1,
-		CategoryL2:    cat2,
-		CategoryL3:    cat3,
-		Tags:          tags,
-		RelatedIDs:    []map[string]any{},
-		DecayRule:     decayRule,
-		IsHighValue:   knowledgeType == KnowledgeTypeInsight || knowledgeType == KnowledgeTypeDialogueExtract,
-	}, nil
-}
-
-func inferDocType(relativePath string, front map[string]any) DocType {
-	if value, ok := front["doc_type"].(string); ok {
-		return DocType(value)
-	}
-	filename := strings.ToLower(filepath.Base(relativePath))
-	if value, ok := rootFileRules[filename]; ok {
-		return value
-	}
-	pathLower := strings.ToLower(relativePath)
-	for _, rule := range docTypeRules {
-		if rule.Pattern.MatchString(pathLower) {
-			return rule.Type
-		}
-	}
-	return ""
-}
-
-func inferKnowledgeType(relativePath string, front map[string]any) (KnowledgeType, InsightType, SourceType) {
-	knowledgeType := KnowledgeTypeDoc
-	if value, ok := front["knowledge_type"].(string); ok {
-		if value != "" {
-			knowledgeType = KnowledgeType(strings.TrimSpace(value))
-		}
-	}
-	var insightType InsightType
-	if value, ok := front["insight_type"].(string); ok {
-		insightType = InsightType(strings.TrimSpace(value))
-	}
-
-	pathLower := strings.ToLower(relativePath)
-	for _, rule := range dialogueRules {
-		if rule.MatchString(pathLower) {
-			return KnowledgeTypeDialogueExtract, insightType, SourceTypeDialogue
-		}
-	}
-
-	for _, rule := range insightPathRules {
-		if rule.Pattern.MatchString(pathLower) {
-			if insightType != "" {
-				return KnowledgeTypeInsight, insightType, SourceTypeFile
-			}
-			return KnowledgeTypeInsight, rule.Type, SourceTypeFile
-		}
-	}
-
-	return knowledgeType, insightType, SourceTypeFile
-}
-
-func shouldWatchFile(settings Settings, relativePath string) bool {
-	base := filepath.Base(relativePath)
-	for _, name := range settings.Watcher.WatchRoot {
-		if name == base {
-			return true
-		}
-	}
-
-	ext := filepath.Ext(relativePath)
-	if ext != "" {
-		allowed := false
-		for _, value := range settings.Watcher.Extensions {
-			if value == ext {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return false
-		}
-	}
-
-	parts := strings.Split(filepath.ToSlash(relativePath), "/")
-	for _, part := range parts {
-		for _, ignore := range settings.Watcher.IgnoreDirs {
-			if part == ignore {
-				return false
-			}
-		}
-	}
-
-	if len(parts) > 0 {
-		top := parts[0]
-		for _, dir := range settings.Watcher.WatchDirs {
-			if top == dir {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func isDialoguePath(relativePath string) bool {
-	pathLower := strings.ToLower(relativePath)
-	for _, rule := range dialogueRules {
-		if rule.MatchString(pathLower) {
-			return true
-		}
-	}
-	return false
-}
-
-func loadProjectMeta(settings Settings, projectRoot string) ProjectMeta {
-	meta := ProjectMeta{ProjectID: settings.Project.DefaultProjectID, RootPath: projectRoot}
-	if projectRoot == "" {
-		return meta
-	}
-	base := filepath.Base(projectRoot)
-	if base != "" && base != string(filepath.Separator) {
-		meta.ProjectID = base
-	}
-	configPath := filepath.Join(projectRoot, ".project.yaml")
-	data, err := os.ReadFile(configPath)
+	tag, err := tx.Exec(ctx, `
+UPDATE memories
+SET content_type = $2,
+    content = $3,
+    content_hash = $4,
+    ts = $5,
+    summary = $6,
+    tags = $7::jsonb,
+    chunk_count = $8,
+    embedding_done = $9,
+    avg_embedding = $10,
+    updated_at = NOW()
+WHERE id = $1`,
+		memory.ID,
+		memory.ContentType,
+		memory.Content,
+		memory.ContentHash,
+		memory.Ts,
+		nullableString(memory.Summary),
+		string(tagsJSON),
+		memory.ChunkCount,
+		memory.Embedded,
+		avgVec,
+	)
 	if err != nil {
-		return meta
+		return err
 	}
-	var raw map[string]any
-	if err := yaml.Unmarshal(data, &raw); err != nil {
-		return meta
-	}
-	if value, ok := raw[settings.Project.ProjectIDKey].(string); ok && value != "" {
-		meta.ProjectID = value
-	}
-	if value, ok := raw[settings.Project.ProjectNameKey].(string); ok && value != "" {
-		meta.ProjectName = value
-	}
-	return meta
-}
-
-func findProjectRoot(settings Settings, filePath string) string {
-	dir := filepath.Dir(filePath)
-	for {
-		for _, marker := range settings.Project.RootMarkers {
-			if exists(filepath.Join(dir, marker)) {
-				return dir
-			}
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		dir = parent
-	}
-	return ""
-}
-
-func extractCategories(relativePath string) (string, string, string) {
-	path := filepath.ToSlash(relativePath)
-	parts := []string{}
-	for _, part := range strings.Split(path, "/") {
-		if part == "docs" || part == "doc" || part == "specs" {
-			continue
-		}
-		parts = append(parts, part)
-	}
-	if len(parts) == 0 {
-		return "", "", ""
-	}
-	last := parts[len(parts)-1]
-	if ext := filepath.Ext(last); ext != "" {
-		parts[len(parts)-1] = strings.TrimSuffix(last, ext)
-	}
-	if len(parts) == 1 {
-		return parts[0], "", ""
-	}
-	if len(parts) == 2 {
-		return parts[0], parts[1], ""
-	}
-	return parts[0], parts[1], parts[2]
-}
-
-func isValidInsightType(value string) bool {
-	switch value {
-	case "solution", "lesson", "pattern", "decision":
-		return true
-	default:
-		return false
-	}
-}
-
-func mergeTags(tags []string, extra []string) []string {
-	return normalizeTags(append(tags, extra...))
-}
-
-func calcExpiresAt(rule DecayRule, now time.Time) *time.Time {
-	if rule == DecayTime30Days {
-		value := now.Add(30 * 24 * time.Hour)
-		return &value
+	if tag.RowsAffected() == 0 {
+		return errors.New("目标记忆不存在")
 	}
 	return nil
 }
 
-func nullableString(value string) any {
-	if strings.TrimSpace(value) == "" {
+func deleteFragmentsTx(ctx context.Context, tx pgxTx, memoryID string) error {
+	if strings.TrimSpace(memoryID) == "" {
+		return errors.New("记忆ID为空")
+	}
+	_, err := tx.Exec(ctx, `DELETE FROM fragments WHERE memory_id = $1`, memoryID)
+	return err
+}
+
+func insertFragmentsTx(ctx context.Context, tx pgxTx, fragments []FragmentInsert) error {
+	if len(fragments) == 0 {
 		return nil
+	}
+	query := `
+INSERT INTO fragments (id, memory_id, chunk_index, content, embedding)
+VALUES ($1,$2,$3,$4,$5)`
+	for _, frag := range fragments {
+		if _, err := tx.Exec(ctx, query, frag.ID, frag.MemoryID, frag.ChunkIndex, frag.Content, pgvector.NewVector(frag.Embedding)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func insertMemoryVersionFromMemoryTx(ctx context.Context, tx pgxTx, memoryID string) error {
+	if strings.TrimSpace(memoryID) == "" {
+		return errors.New("记忆ID为空")
+	}
+	tag, err := tx.Exec(ctx, `
+INSERT INTO memory_versions (
+  memory_id, project_id, content_type, content, content_hash, ts,
+  summary, tags, chunk_count, avg_embedding, created_at, replaced_at
+)
+SELECT id, project_id, content_type, content, content_hash, ts,
+       summary, tags, chunk_count, avg_embedding, created_at, NOW()
+FROM memories
+WHERE id = $1`, memoryID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return errors.New("旧记忆不存在")
+	}
+	return nil
+}
+
+func insertArbitrationLogTx(ctx context.Context, tx pgxTx, log ArbitrationLogInsert) error {
+	_, err := tx.Exec(ctx, `
+INSERT INTO memory_arbitrations (
+  owner_id, project_id, candidate_memory_id, new_memory_id,
+  action, similarity, old_summary, new_summary, model, created_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		log.OwnerID,
+		log.ProjectID,
+		nullableString(log.CandidateMemoryID),
+		nullableString(log.NewMemoryID),
+		log.Action,
+		log.Similarity,
+		nullableString(log.OldSummary),
+		nullableString(log.NewSummary),
+		nullableString(log.Model),
+		log.CreatedAt,
+	)
+	return err
+}
+
+func hashContent(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
+
+func fallbackSummary(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return ""
+	}
+	return truncateRunes(trimmed, 100)
+}
+
+func averageEmbedding(embeddings [][]float32, dimension int) []float32 {
+	if dimension <= 0 && len(embeddings) > 0 {
+		dimension = len(embeddings[0])
+	}
+	if dimension <= 0 {
+		return []float32{}
+	}
+	if len(embeddings) == 0 {
+		return make([]float32, dimension)
+	}
+	sum := make([]float32, dimension)
+	count := 0
+	for _, vec := range embeddings {
+		if len(vec) < dimension {
+			continue
+		}
+		for i := 0; i < dimension; i++ {
+			sum[i] += vec[i]
+		}
+		count++
+	}
+	if count == 0 {
+		return make([]float32, dimension)
+	}
+	for i := 0; i < dimension; i++ {
+		sum[i] /= float32(count)
+	}
+	return sum
+}
+
+// l2Normalize 对向量做 L2 归一化，使余弦相似度计算更准确
+func l2Normalize(vec []float32) []float32 {
+	if len(vec) == 0 {
+		return vec
+	}
+	var sumSq float64
+	for _, v := range vec {
+		sumSq += float64(v) * float64(v)
+	}
+	if sumSq == 0 {
+		return vec
+	}
+	norm := float32(1.0 / math.Sqrt(sumSq))
+	result := make([]float32, len(vec))
+	for i, v := range vec {
+		result[i] = v * norm
+	}
+	return result
+}
+
+// findSemanticUpdateCandidate 使用 memory 级别的 avg_embedding 检测语义冲突
+// 只按 project_id 过滤，不按 content_type（因为类型不严格互斥）
+func findSemanticUpdateCandidate(ctx context.Context, store *Store, vector pgvector.Vector, projectID string, threshold float64, maxCandidates int) (string, float64, error) {
+	if maxCandidates <= 0 {
+		maxCandidates = defaultSemanticUpdateCandidates
+	}
+	if threshold <= 0 {
+		threshold = 0.85
+	}
+	if threshold > 1 {
+		threshold = 1
+	}
+	// 直接在 memory 级别做向量搜索，更准确
+	rows, err := store.SearchMemoryVectors(ctx, vector, projectID, maxCandidates)
+	if err != nil {
+		return "", 0, err
+	}
+	if len(rows) == 0 {
+		return "", 0, nil
+	}
+	// 取相似度最高的
+	bestRow := rows[0]
+	bestSim := distanceToSimilarity(bestRow.Distance)
+	if bestSim < threshold {
+		return "", bestSim, nil
+	}
+	return bestRow.ID, bestSim, nil
+}
+
+func distanceToSimilarity(distance float64) float64 {
+	sim := 1 - distance
+	if sim > 1 {
+		return 1
+	}
+	if sim < -1 {
+		return -1
+	}
+	return sim
+}
+
+func semanticUpdateThreshold(value float64) float64 {
+	if value <= 0 {
+		return 0.85
+	}
+	if value > 1 {
+		return 1
 	}
 	return value
-}
-
-func nullableJSON(raw []byte) any {
-	if len(raw) == 0 {
-		return nil
-	}
-	return raw
-}
-
-func nullableTime(value *time.Time) any {
-	if value == nil || value.IsZero() {
-		return nil
-	}
-	return *value
-}
-
-func nullableBool(value *bool) any {
-	if value == nil {
-		return nil
-	}
-	return *value
-}
-
-func (k *KnowledgeIngest) SummaryOrContent() string {
-	if strings.TrimSpace(k.Summary) != "" {
-		return k.Summary
-	}
-	return k.Content
 }

@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
-
-	"github.com/pgvector/pgvector-go"
+	"unicode"
 )
 
 type Searcher struct {
@@ -17,192 +15,263 @@ type Searcher struct {
 	settings Settings
 }
 
-type Route struct {
-	DocTypes       []string
-	MustLatest     bool
-	TimeFilterDays *int
-	OrderBy        string
-}
-
-type SearchRow struct {
-	ID            string
-	Title         string
-	FilePath      string
-	Summary       string
-	Content       string
-	DocType       string
-	KnowledgeType string
-	ProjectID     string
-	Score         float64
-}
-
 func NewSearcher(store *Store, llm *LLMClient, embedder *Embedder, settings Settings) *Searcher {
 	return &Searcher{store: store, llm: llm, embedder: embedder, settings: settings}
 }
 
-func (s *Searcher) Search(ctx context.Context, in SearchInput) ([]map[string]any, error) {
-	query := strings.TrimSpace(in.Query)
+func (s *Searcher) Search(ctx context.Context, input SearchInput) (SearchResponse, error) {
+	query := strings.TrimSpace(input.Query)
 	if query == "" {
-		return nil, fmt.Errorf("query 不能为空")
+		return SearchResponse{}, fmt.Errorf("query 不能为空")
 	}
 
-	limit := 5
-	if in.Limit != nil && *in.Limit > 0 {
-		limit = *in.Limit
-	}
-	useRouting := true
-	if in.UseRouting != nil {
-		useRouting = *in.UseRouting
-	}
-	useRerank := s.settings.Rerank.Enabled
-	if in.UseRerank != nil {
-		useRerank = *in.UseRerank
+	limit := input.Limit
+	if limit <= 0 {
+		limit = 20
 	}
 
-	docTypes := append([]string{}, in.DocTypes...)
-	knowledgeTypes := append([]string{}, in.KnowledgeTypes...)
-	mustLatest := true
-	var timeFilterDays *int
-	orderBy := "relevance"
+	scope := input.Scope
+	if scope == "" {
+		scope = "all"
+	}
 
-	if useRouting {
-		route := s.llm.RouteQuery(query)
-		mustLatest = route.MustLatest
-		timeFilterDays = route.TimeFilterDays
-		if route.OrderBy != "" {
-			orderBy = route.OrderBy
+	projectScoped := strings.TrimSpace(input.ProjectKey) != ""
+	projectID := ""
+	if projectScoped {
+		var err error
+		projectID, err = s.store.FindProjectIDByKey(ctx, input.OwnerID, input.ProjectKey)
+		if err != nil {
+			return SearchResponse{}, err
 		}
-		for _, value := range route.DocTypes {
-			if value == "insight" || value == "dialogue_extract" {
-				knowledgeTypes = append(knowledgeTypes, value)
-			} else {
-				docTypes = append(docTypes, value)
-			}
+		if projectID == "" {
+			return SearchResponse{Results: []SearchResult{}, Metadata: SearchMetadata{Total: 0, Returned: 0, NextAction: "use_ids_to_call_mem_get"}}, nil
 		}
 	}
 
+	initialLimit := limit * 5
+	var vectorRows []FragmentRow
 	vector, err := s.embedder.EmbedQuery(query)
-	if err != nil {
-		return nil, err
-	}
-
-	if orderBy == "time_desc" {
-		useRerank = false
-	}
-
-	initialLimit := limit
-	if useRerank {
-		initialLimit = limit * 5
-	}
-
-	params := SearchParams{
-		ProjectID:      strings.TrimSpace(in.ProjectID),
-		DocTypes:       uniqueStrings(docTypes),
-		KnowledgeTypes: uniqueStrings(knowledgeTypes),
-		Limit:          initialLimit,
-		MustLatest:     mustLatest,
-		OrderBy:        orderBy,
-	}
-	if timeFilterDays != nil {
-		since := time.Now().UTC().Add(-time.Duration(*timeFilterDays) * 24 * time.Hour)
-		params.Since = &since
-	}
-
-	rows, err := s.store.SearchVector(ctx, vector, params)
-	if err != nil {
-		return nil, err
-	}
-
-	if !useRerank || len(rows) == 0 {
-		results := make([]map[string]any, 0, len(rows))
-		for _, row := range rows {
-			results = append(results, map[string]any{
-				"id":             row.ID,
-				"title":          row.Title,
-				"file_path":      row.FilePath,
-				"summary":        row.Summary,
-				"doc_type":       row.DocType,
-				"knowledge_type": row.KnowledgeType,
-				"score":          row.Score,
-				"project_id":     row.ProjectID,
-			})
+	if err == nil {
+		if projectScoped {
+			vectorRows, err = s.store.SearchVectorFragments(ctx, vector, projectID, scope, initialLimit)
+		} else {
+			vectorRows, err = s.store.SearchVectorFragmentsByOwner(ctx, vector, input.OwnerID, scope, initialLimit)
 		}
-		if len(results) > limit {
-			return results[:limit], nil
+		if err != nil {
+			return SearchResponse{}, err
 		}
-		return results, nil
 	}
 
+	lexicalQuery := normalizeQuery(query)
+	if lexicalQuery == "" {
+		lexicalQuery = query
+	}
+
+	keywords := []string{lexicalQuery}
+	if s.settings.QueryExpand.Enabled && s.llm != nil {
+		expanded := s.llm.ExpandQuery(query)
+		if len(expanded) > 0 {
+			keywords = append(keywords, expanded...)
+		}
+	}
+	keywords = uniqueStrings(keywords)
+
+	var sources [][]FragmentRow
+	sources = append(sources, vectorRows)
+
+	for _, keyword := range keywords {
+		if keyword == "" {
+			continue
+		}
+		var keywordRows []FragmentRow
+		if projectScoped {
+			keywordRows, err = s.store.SearchKeywordFragments(ctx, keyword, projectID, scope, initialLimit)
+		} else {
+			keywordRows, err = s.store.SearchKeywordFragmentsByOwner(ctx, keyword, input.OwnerID, scope, initialLimit)
+		}
+		if err != nil {
+			return SearchResponse{}, err
+		}
+		if len(keywordRows) > 0 {
+			sources = append(sources, keywordRows)
+		}
+
+		var bm25Rows []FragmentRow
+		if projectScoped {
+			bm25Rows, err = s.store.SearchBM25Fragments(ctx, keyword, projectID, scope, initialLimit)
+		} else {
+			bm25Rows, err = s.store.SearchBM25FragmentsByOwner(ctx, keyword, input.OwnerID, scope, initialLimit)
+		}
+		if err != nil {
+			return SearchResponse{}, err
+		}
+		if len(bm25Rows) > 0 {
+			sources = append(sources, bm25Rows)
+		}
+	}
+
+	combined := rrfMerge(sources...)
+	if len(combined) == 0 {
+		return SearchResponse{Results: []SearchResult{}, Metadata: SearchMetadata{Total: 0, Returned: 0, NextAction: "use_ids_to_call_mem_get"}}, nil
+	}
+
+	combined = dedupeByMemory(combined, limit*3)
+	totalCount := len(combined)
+	combined = maybeRerank(ctx, s, query, combined, limit)
+
+	if len(combined) > limit {
+		combined = combined[:limit]
+	}
+
+	results := make([]SearchResult, 0, len(combined))
+	for _, row := range combined {
+		snippet := buildSnippet(row.Content, 200)
+		results = append(results, SearchResult{
+			ID:          row.MemoryID,
+			Snippet:     snippet,
+			ContentType: row.ContentType,
+			Score:       row.RankScore,
+			Ts:          row.Ts,
+			ChunkIndex:  row.ChunkIndex,
+			TotalChunks: row.ChunkCount,
+		})
+	}
+	return SearchResponse{
+		Results: results,
+		Metadata: SearchMetadata{
+			Total:      totalCount,
+			Returned:   len(results),
+			NextAction: "use_ids_to_call_mem_get",
+		},
+	}, nil
+}
+
+func rrfMerge(lists ...[]FragmentRow) []FragmentRow {
+	const k = 60.0
+	combined := map[string]*FragmentRow{}
+	for _, list := range lists {
+		for idx, row := range list {
+			rank := float64(idx + 1)
+			score := 1.0 / (k + rank)
+			key := row.FragmentID
+			existing, ok := combined[key]
+			if !ok {
+				copyRow := row
+				copyRow.RankScore = score
+				combined[key] = &copyRow
+				continue
+			}
+			existing.RankScore += score
+		}
+	}
+
+	results := make([]FragmentRow, 0, len(combined))
+	for _, row := range combined {
+		results = append(results, *row)
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].RankScore == results[j].RankScore {
+			return results[i].Ts > results[j].Ts
+		}
+		return results[i].RankScore > results[j].RankScore
+	})
+	return results
+}
+
+func dedupeByMemory(rows []FragmentRow, limit int) []FragmentRow {
+	if limit <= 0 {
+		limit = len(rows)
+	}
+	seen := map[string]bool{}
+	var result []FragmentRow
+	for _, row := range rows {
+		if seen[row.MemoryID] {
+			continue
+		}
+		seen[row.MemoryID] = true
+		result = append(result, row)
+		if len(result) >= limit {
+			return result
+		}
+	}
+	return result
+}
+
+func maybeRerank(ctx context.Context, s *Searcher, query string, rows []FragmentRow, limit int) []FragmentRow {
+	if !s.settings.Rerank.Enabled || s.llm == nil || len(rows) == 0 {
+		return rows
+	}
+	topN := s.settings.Rerank.TopN
+	if topN <= 0 {
+		topN = limit
+	}
+	if topN <= 0 {
+		topN = 10
+	}
+	if topN > len(rows) {
+		topN = len(rows)
+	}
 	docs := make([]string, 0, len(rows))
 	for _, row := range rows {
-		text := strings.TrimSpace(row.Summary) + "\n" + strings.TrimSpace(row.Content)
-		docs = append(docs, truncate(text, 2000))
+		docs = append(docs, truncateRunes(strings.TrimSpace(row.Content), 2000))
+	}
+	results, err := s.llm.Rerank(query, docs, topN)
+	if err != nil || len(results) == 0 {
+		return rows
 	}
 
-	rerank, err := s.llm.Rerank(query, docs, limit)
-	if err != nil || len(rerank) == 0 {
-		results := make([]map[string]any, 0, len(rows))
-		for _, row := range rows {
-			results = append(results, map[string]any{
-				"id":             row.ID,
-				"title":          row.Title,
-				"file_path":      row.FilePath,
-				"summary":        row.Summary,
-				"doc_type":       row.DocType,
-				"knowledge_type": row.KnowledgeType,
-				"score":          row.Score,
-				"project_id":     row.ProjectID,
-			})
-		}
-		if len(results) > limit {
-			return results[:limit], nil
-		}
-		return results, nil
-	}
-
-	results := make([]map[string]any, 0, len(rerank))
-	for _, item := range rerank {
+	ordered := make([]FragmentRow, 0, len(results))
+	seen := map[int]bool{}
+	for _, item := range results {
 		if item.Index < 0 || item.Index >= len(rows) {
 			continue
 		}
-		row := rows[item.Index]
-		results = append(results, map[string]any{
-			"id":             row.ID,
-			"title":          row.Title,
-			"file_path":      row.FilePath,
-			"summary":        row.Summary,
-			"doc_type":       row.DocType,
-			"knowledge_type": row.KnowledgeType,
-			"score":          item.RelevanceScore,
-			"project_id":     row.ProjectID,
-			"is_reranked":    true,
-		})
-	}
-	sort.Slice(results, func(i, j int) bool {
-		scoreI, _ := results[i]["score"].(float64)
-		scoreJ, _ := results[j]["score"].(float64)
-		return scoreI > scoreJ
-	})
-	if len(results) > limit {
-		return results[:limit], nil
-	}
-	return results, nil
-}
-
-func (s *Searcher) SearchSimilar(ctx context.Context, vector pgvector.Vector, projectID string, docType string, limit int) ([]map[string]any, error) {
-	return s.store.SearchSimilar(ctx, vector, projectID, docType, limit)
-}
-
-func uniqueStrings(values []string) []string {
-	seen := map[string]bool{}
-	var result []string
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value == "" || seen[value] {
+		if seen[item.Index] {
 			continue
 		}
-		seen[value] = true
-		result = append(result, value)
+		seen[item.Index] = true
+		row := rows[item.Index]
+		row.RankScore = item.RelevanceScore
+		ordered = append(ordered, row)
 	}
-	return result
+	if len(ordered) == 0 {
+		return rows
+	}
+
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].RankScore == ordered[j].RankScore {
+			return ordered[i].Ts > ordered[j].Ts
+		}
+		return ordered[i].RankScore > ordered[j].RankScore
+	})
+	return ordered
+}
+
+func buildSnippet(content string, limit int) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return ""
+	}
+	if len([]rune(trimmed)) <= limit {
+		return trimmed
+	}
+	return truncateRunes(trimmed, limit) + "..."
+}
+
+func normalizeQuery(query string) string {
+	var builder strings.Builder
+	lastSpace := false
+	for _, r := range query {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			builder.WriteRune(r)
+			lastSpace = false
+			continue
+		}
+		if !lastSpace {
+			builder.WriteRune(' ')
+			lastSpace = true
+		}
+	}
+	return strings.TrimSpace(builder.String())
 }

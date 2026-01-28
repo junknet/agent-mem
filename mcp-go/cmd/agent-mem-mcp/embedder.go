@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/pgvector/pgvector-go"
 )
@@ -13,6 +14,7 @@ type Embedder struct {
 	provider  string
 	model     string
 	dimension int
+	batchSize int
 	client    *QwenClient
 }
 
@@ -25,6 +27,7 @@ func NewEmbedder(settings Settings) *Embedder {
 		provider:  provider,
 		model:     settings.Embedding.Model,
 		dimension: settings.Embedding.Dimension,
+		batchSize: settings.Embedding.BatchSize,
 		client:    NewQwenClient(settings),
 	}
 }
@@ -38,6 +41,21 @@ func (e *Embedder) EmbedQuery(text string) (pgvector.Vector, error) {
 		return pgvector.NewVector(make([]float32, e.dimension)), nil
 	}
 	return vectors[0], nil
+}
+
+func (e *Embedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	if len(texts) == 0 {
+		return [][]float32{}, nil
+	}
+	vectors, err := e.embed(ctx, texts)
+	if err != nil {
+		return nil, err
+	}
+	result := make([][]float32, 0, len(vectors))
+	for _, vector := range vectors {
+		result = append(result, vector.Slice())
+	}
+	return result, nil
 }
 
 func (e *Embedder) embed(ctx context.Context, texts []string) ([]pgvector.Vector, error) {
@@ -57,14 +75,38 @@ func (e *Embedder) embed(ctx context.Context, texts []string) ([]pgvector.Vector
 		if e.model == "" {
 			return nil, fmt.Errorf("缺少向量模型配置")
 		}
-		vectors, err := e.client.Embeddings(ctx, e.model, texts)
-		if err != nil {
-			return nil, err
+		batchSize := e.batchSize
+		if batchSize <= 0 {
+			batchSize = 10
 		}
-		result := make([]pgvector.Vector, 0, len(vectors))
-		for _, vector := range vectors {
-			vector = e.normalize(vector)
-			result = append(result, pgvector.NewVector(vector))
+		if batchSize > 10 {
+			batchSize = 10
+		}
+		result := make([]pgvector.Vector, 0, len(texts))
+		for start := 0; start < len(texts); start += batchSize {
+			end := start + batchSize
+			if end > len(texts) {
+				end = len(texts)
+			}
+			var vectors [][]float32
+			var err error
+			for attempt := 0; attempt < 3; attempt++ {
+				vectors, err = e.client.Embeddings(ctx, e.model, texts[start:end])
+				if err == nil {
+					break
+				}
+				time.Sleep(time.Duration(200*(1<<attempt)) * time.Millisecond)
+			}
+			if err != nil {
+				return nil, err
+			}
+			if len(vectors) != end-start {
+				return nil, fmt.Errorf("向量数量不匹配")
+			}
+			for _, vector := range vectors {
+				vector = e.normalize(vector)
+				result = append(result, pgvector.NewVector(vector))
+			}
 		}
 		return result, nil
 	case "fastembed":
