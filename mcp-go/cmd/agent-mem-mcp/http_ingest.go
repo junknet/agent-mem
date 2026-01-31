@@ -147,7 +147,7 @@ func handleGetMemories(w http.ResponseWriter, r *http.Request, app *App) {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "仅支持 GET", "ERR_METHOD")
 		return
 	}
-	if err := rejectUnknownQuery(r, map[string]bool{"ids": true}); err != nil {
+	if err := rejectUnknownQuery(r, map[string]bool{"ids": true, "owner_id": true}); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_field", err.Error(), "ERR_INVALID_FIELD")
 		return
 	}
