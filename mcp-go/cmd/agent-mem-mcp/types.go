@@ -65,7 +65,8 @@ type SearchResponse struct {
 }
 
 type GetMemoriesInput struct {
-	IDs []string `json:"ids"`
+	IDs     []string `json:"ids"`
+	OwnerID string   `json:"owner_id,omitempty"` // 可选，兼容 Codex 传参
 }
 
 type MemoryRecord struct {
