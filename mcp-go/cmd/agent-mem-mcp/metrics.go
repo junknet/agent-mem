@@ -34,24 +34,28 @@ func (a *App) Metrics(ctx context.Context, input IndexInput) (MetricsResponse, e
 		}
 	}
 
-	counts, err := a.store.FetchMemoryCounts(ctx, projectID, normalized.OwnerID, normalized.IndexPath)
+	var indexPath []string
+	if normalized.IndexPath != nil {
+		indexPath = *normalized.IndexPath
+	}
+	counts, err := a.store.FetchMemoryCounts(ctx, projectID, normalized.OwnerID, indexPath)
 	if err != nil {
 		return MetricsResponse{}, err
 	}
-	depthDist, err := a.store.FetchIndexPathDepthDistribution(ctx, projectID, normalized.OwnerID, normalized.IndexPath)
+	depthDist, err := a.store.FetchIndexPathDepthDistribution(ctx, projectID, normalized.OwnerID, indexPath)
 	if err != nil {
 		return MetricsResponse{}, err
 	}
-	tree, err := a.store.FetchIndexPaths(ctx, projectID, normalized.OwnerID, normalized.Limit, normalized.IndexPath)
+	tree, err := a.store.FetchIndexPaths(ctx, projectID, normalized.OwnerID, normalized.Limit, indexPath)
 	if err != nil {
 		return MetricsResponse{}, err
 	}
 	pathsForTree := tree
-	if len(normalized.IndexPath) > 0 {
-		pathsForTree = trimIndexPathCounts(tree, normalized.IndexPath)
+	if len(indexPath) > 0 {
+		pathsForTree = trimIndexPathCounts(tree, indexPath)
 	}
 	pathTree := buildIndexPathTree(pathsForTree, normalized.PathTreeDepth, normalized.PathTreeWidth)
-	stats := buildIndexStats(counts, depthDist, pathTree, len(normalized.IndexPath))
+	stats := buildIndexStats(counts, depthDist, pathTree, len(indexPath))
 
 	var builder strings.Builder
 	writeGauge(&builder, "agent_mem_total_memories", stats.TotalMemories, normalized)
@@ -82,11 +86,15 @@ func writeDepthMetric(builder *strings.Builder, name string, depth int, count in
 }
 
 func metricsLabels(input IndexInput, extra string) string {
+	var indexPathStr string
+	if input.IndexPath != nil {
+		indexPathStr = strings.Join(*input.IndexPath, "/")
+	}
 	base := []string{
 		fmt.Sprintf("owner_id=\"%s\"", escapeLabel(input.OwnerID)),
 		fmt.Sprintf("project_key=\"%s\"", escapeLabel(input.ProjectKey)),
 		fmt.Sprintf("project_name=\"%s\"", escapeLabel(input.ProjectName)),
-		fmt.Sprintf("path_prefix=\"%s\"", escapeLabel(strings.Join(input.IndexPath, "/"))),
+		fmt.Sprintf("path_prefix=\"%s\"", escapeLabel(indexPathStr)),
 	}
 	if extra != "" {
 		base = append(base, extra)
@@ -101,11 +109,15 @@ func escapeLabel(value string) string {
 }
 
 func metricsCacheKey(input IndexInput) string {
+	var indexPathStr string
+	if input.IndexPath != nil {
+		indexPathStr = strings.Join(*input.IndexPath, "/")
+	}
 	key := strings.Join([]string{
 		input.OwnerID,
 		input.ProjectKey,
 		input.ProjectName,
-		strings.Join(input.IndexPath, "/"),
+		indexPathStr,
 		fmt.Sprintf("%d", input.Limit),
 		fmt.Sprintf("%d", input.PathTreeDepth),
 		fmt.Sprintf("%d", input.PathTreeWidth),

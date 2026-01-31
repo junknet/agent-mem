@@ -11,10 +11,10 @@ type IngestMemoryInput struct {
 	ContentType string      `json:"content_type"`
 	Content     string      `json:"content"`
 	Summary     string      `json:"summary,omitempty"`
-	Tags        []string    `json:"tags,omitempty"`
+	Tags        *[]string   `json:"tags,omitempty"`
 	SkipLLM     bool        `json:"skip_llm,omitempty"`
 	Axes        *MemoryAxes `json:"axes,omitempty"`
-	IndexPath   []string    `json:"index_path,omitempty"`
+	IndexPath   *[]string   `json:"index_path,omitempty"`
 	Ts          int64       `json:"ts"`
 }
 
@@ -32,10 +32,10 @@ type SearchInput struct {
 	ProjectPath string      `json:"project_path"`
 	Query       string      `json:"query"`
 	Scope       string      `json:"scope"`
-	Profile     string      `json:"profile,omitempty"`
-	Mode        string      `json:"mode,omitempty"`
+	Profile     *string     `json:"profile,omitempty"`
+	Mode        *string     `json:"mode,omitempty"`
 	Axes        *MemoryAxes `json:"axes,omitempty"`
-	IndexPath   []string    `json:"index_path,omitempty"`
+	IndexPath   *[]string   `json:"index_path,omitempty"`
 	Limit       int         `json:"limit"`
 }
 
@@ -226,15 +226,15 @@ type SearchTrace struct {
 }
 
 type IndexInput struct {
-	OwnerID       string   `json:"owner_id"`
-	ProjectKey    string   `json:"project_key"`
-	ProjectName   string   `json:"project_name"`
-	MachineName   string   `json:"machine_name"`
-	ProjectPath   string   `json:"project_path"`
-	Limit         int      `json:"limit"`
-	IndexPath     []string `json:"index_path"`
-	PathTreeDepth int      `json:"path_tree_depth"`
-	PathTreeWidth int      `json:"path_tree_width"`
+	OwnerID       string    `json:"owner_id"`
+	ProjectKey    string    `json:"project_key"`
+	ProjectName   string    `json:"project_name"`
+	MachineName   string    `json:"machine_name"`
+	ProjectPath   string    `json:"project_path"`
+	Limit         int       `json:"limit"`
+	IndexPath     *[]string `json:"index_path"`
+	PathTreeDepth int       `json:"path_tree_depth"`
+	PathTreeWidth int       `json:"path_tree_width"`
 }
 
 type AxisCount struct {

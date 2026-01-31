@@ -63,13 +63,13 @@ func validateIngestInput(input IngestMemoryInput) error {
 	if err := validateSummary(input.Summary); err != nil {
 		return err
 	}
-	if err := validateTags(input.Tags); err != nil {
+	if err := validateTagsPtr(input.Tags); err != nil {
 		return err
 	}
 	if err := validateAxes(input.Axes); err != nil {
 		return err
 	}
-	if err := validateIndexPath(input.IndexPath); err != nil {
+	if err := validateIndexPathPtr(input.IndexPath); err != nil {
 		return err
 	}
 	return nil
@@ -112,10 +112,10 @@ func validateSearchInput(input SearchInput) error {
 	if input.Scope != "all" && !contentTypeSet[input.Scope] {
 		return newValidationError("invalid_request", "ERR_INVALID_SCOPE", "scope 无效", 400)
 	}
-	if err := validateSearchProfile(input.Profile); err != nil {
+	if err := validateSearchProfilePtr(input.Profile); err != nil {
 		return err
 	}
-	if err := validateSearchMode(input.Mode); err != nil {
+	if err := validateSearchModePtr(input.Mode); err != nil {
 		return err
 	}
 	if input.Limit < 1 || input.Limit > 100 {
@@ -124,7 +124,7 @@ func validateSearchInput(input SearchInput) error {
 	if err := validateAxes(input.Axes); err != nil {
 		return err
 	}
-	if err := validateIndexPath(input.IndexPath); err != nil {
+	if err := validateIndexPathPtr(input.IndexPath); err != nil {
 		return err
 	}
 	return nil
@@ -185,7 +185,7 @@ func validateIndexInput(input IndexInput) error {
 	if err := validateProjectPathOptional(input.ProjectPath); err != nil {
 		return err
 	}
-	if err := validateIndexPath(input.IndexPath); err != nil {
+	if err := validateIndexPathPtr(input.IndexPath); err != nil {
 		return err
 	}
 	if input.Limit < 1 || input.Limit > 200 {
@@ -462,4 +462,34 @@ func isAbsolutePath(path string) bool {
 		}
 	}
 	return false
+}
+
+// 指针类型验证函数（支持 null 值）
+
+func validateSearchProfilePtr(profile *string) error {
+	if profile == nil {
+		return nil
+	}
+	return validateSearchProfile(*profile)
+}
+
+func validateSearchModePtr(mode *string) error {
+	if mode == nil {
+		return nil
+	}
+	return validateSearchMode(*mode)
+}
+
+func validateIndexPathPtr(path *[]string) error {
+	if path == nil {
+		return nil
+	}
+	return validateIndexPath(*path)
+}
+
+func validateTagsPtr(tags *[]string) error {
+	if tags == nil {
+		return nil
+	}
+	return validateTags(*tags)
 }

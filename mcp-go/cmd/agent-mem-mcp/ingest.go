@@ -49,7 +49,10 @@ func (a *App) IngestMemory(ctx context.Context, input IngestMemoryInput) (Ingest
 	}
 
 	summary := strings.TrimSpace(input.Summary)
-	tags := normalizeTags(input.Tags)
+	var tags []string
+	if input.Tags != nil {
+		tags = normalizeTags(*input.Tags)
+	}
 	contentTrimmed := strings.TrimSpace(input.Content)
 	skipLLM := input.SkipLLM || len([]rune(contentTrimmed)) <= 120
 	if !skipLLM {
@@ -71,7 +74,10 @@ func (a *App) IngestMemory(ctx context.Context, input IngestMemoryInput) (Ingest
 	if input.Axes != nil {
 		axes = *input.Axes
 	}
-	indexPath := input.IndexPath
+	var indexPath []string
+	if input.IndexPath != nil {
+		indexPath = *input.IndexPath
+	}
 	if a.settings.Indexing.Enabled && !skipLLM {
 		needExtract := !a.settings.Indexing.PreferClient || axesEmpty(axes) || len(indexPath) == 0
 		extractedAxes := MemoryAxes{}

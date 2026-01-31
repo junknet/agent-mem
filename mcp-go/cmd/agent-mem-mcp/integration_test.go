@@ -11,6 +11,10 @@ import (
 	"unicode/utf8"
 )
 
+// 测试辅助函数
+func strSlicePtr(s []string) *[]string { return &s }
+func strArrPtr(s ...string) *[]string  { return &s }
+
 func TestIngestSearchFlow(t *testing.T) {
 	if os.Getenv("AGENT_MEM_INTEGRATION") == "" {
 		t.Skip("未设置 AGENT_MEM_INTEGRATION，跳过集成测试")
@@ -123,6 +127,11 @@ func TestIndexPathTreeIntegration(t *testing.T) {
 
 	projectName := "agent-mem-index-test"
 	now := time.Now().UTC().Unix()
+	tagsAlpha := []string{"alpha"}
+	tagsBeta := []string{"beta"}
+	pathAlpha := []string{"root", "alpha"}
+	pathAlphaChild := []string{"root", "alpha", "child"}
+	pathBeta := []string{"root", "beta"}
 	entries := []IngestMemoryInput{
 		{
 			OwnerID:     "personal",
@@ -130,9 +139,9 @@ func TestIndexPathTreeIntegration(t *testing.T) {
 			ProjectKey:  projectName,
 			ContentType: "development",
 			Content:     "root alpha decision one",
-			Tags:        []string{"alpha"},
+			Tags:        &tagsAlpha,
 			Axes:        &MemoryAxes{Domain: []string{"backend"}},
-			IndexPath:   []string{"root", "alpha"},
+			IndexPath:   &pathAlpha,
 			Ts:          now,
 		},
 		{
@@ -141,9 +150,9 @@ func TestIndexPathTreeIntegration(t *testing.T) {
 			ProjectKey:  projectName,
 			ContentType: "development",
 			Content:     "root alpha decision two",
-			Tags:        []string{"alpha"},
+			Tags:        &tagsAlpha,
 			Axes:        &MemoryAxes{Domain: []string{"backend"}},
-			IndexPath:   []string{"root", "alpha", "child"},
+			IndexPath:   &pathAlphaChild,
 			Ts:          now + 1,
 		},
 		{
@@ -152,9 +161,9 @@ func TestIndexPathTreeIntegration(t *testing.T) {
 			ProjectKey:  projectName,
 			ContentType: "development",
 			Content:     "root beta decision",
-			Tags:        []string{"beta"},
+			Tags:        &tagsBeta,
 			Axes:        &MemoryAxes{Domain: []string{"frontend"}},
-			IndexPath:   []string{"root", "beta"},
+			IndexPath:   &pathBeta,
 			Ts:          now + 2,
 		},
 		{
@@ -163,9 +172,9 @@ func TestIndexPathTreeIntegration(t *testing.T) {
 			ProjectKey:  projectName,
 			ContentType: "development",
 			Content:     "other gamma decision",
-			Tags:        []string{"gamma"},
+			Tags: strArrPtr("gamma"),
 			Axes:        &MemoryAxes{Domain: []string{"ops"}},
-			IndexPath:   []string{"other", "gamma"},
+			IndexPath:   strArrPtr("other", "gamma"),
 			Ts:          now + 3,
 		},
 	}
@@ -188,13 +197,14 @@ func TestIndexPathTreeIntegration(t *testing.T) {
 		t.Fatalf("重复写入状态错误: %s", duplicate.Status)
 	}
 
+	searchIndexPath := []string{"root", "alpha"}
 	search := SearchInput{
 		OwnerID:     "personal",
 		ProjectName: projectName,
 		ProjectKey:  projectName,
 		Query:       "alpha",
 		Scope:       "development",
-		IndexPath:   []string{"root", "alpha"},
+		IndexPath:   &searchIndexPath,
 		Limit:       5,
 	}
 	searchResp, err := app.SearchMemories(ctx, search)
@@ -209,7 +219,7 @@ func TestIndexPathTreeIntegration(t *testing.T) {
 		OwnerID:       "personal",
 		ProjectName:   projectName,
 		ProjectKey:    projectName,
-		IndexPath:     []string{"root"},
+		IndexPath:     strArrPtr("root"),
 		Limit:         20,
 		PathTreeDepth: 2,
 		PathTreeWidth: 10,
@@ -256,7 +266,7 @@ func TestIndexPathTreeDepthWidthIntegration(t *testing.T) {
 			ProjectKey:  projectName,
 			ContentType: "development",
 			Content:     "root a x",
-			IndexPath:   []string{"root", "a", "x"},
+			IndexPath:   strArrPtr("root", "a", "x"),
 			Ts:          now,
 		},
 		{
@@ -265,7 +275,7 @@ func TestIndexPathTreeDepthWidthIntegration(t *testing.T) {
 			ProjectKey:  projectName,
 			ContentType: "development",
 			Content:     "root a y",
-			IndexPath:   []string{"root", "a", "y"},
+			IndexPath:   strArrPtr("root", "a", "y"),
 			Ts:          now + 1,
 		},
 		{
@@ -274,7 +284,7 @@ func TestIndexPathTreeDepthWidthIntegration(t *testing.T) {
 			ProjectKey:  projectName,
 			ContentType: "development",
 			Content:     "root b z",
-			IndexPath:   []string{"root", "b", "z"},
+			IndexPath:   strArrPtr("root", "b", "z"),
 			Ts:          now + 2,
 		},
 		{
@@ -283,7 +293,7 @@ func TestIndexPathTreeDepthWidthIntegration(t *testing.T) {
 			ProjectKey:  projectName,
 			ContentType: "development",
 			Content:     "root c t",
-			IndexPath:   []string{"root", "c", "t"},
+			IndexPath:   strArrPtr("root", "c", "t"),
 			Ts:          now + 3,
 		},
 	}
@@ -298,7 +308,7 @@ func TestIndexPathTreeDepthWidthIntegration(t *testing.T) {
 		OwnerID:       "personal",
 		ProjectName:   projectName,
 		ProjectKey:    projectName,
-		IndexPath:     []string{"root"},
+		IndexPath:     strArrPtr("root"),
 		Limit:         50,
 		PathTreeDepth: 1,
 		PathTreeWidth: 2,
@@ -349,9 +359,9 @@ func TestConflictKnowledgeAcrossProjectsIntegration(t *testing.T) {
 			ProjectKey:  alpha,
 			ContentType: "insight",
 			Content:     "数据库选择 PostgreSQL，性能优先，适合核心系统。",
-			Tags:        []string{"db", "postgresql"},
+			Tags: strArrPtr("db", "postgresql"),
 			Axes:        &MemoryAxes{Domain: []string{"backend"}, Problem: []string{"performance"}},
-			IndexPath:   []string{"decisions", "db", "primary"},
+			IndexPath:   strArrPtr("decisions", "db", "primary"),
 			SkipLLM:     true,
 			Ts:          now,
 		},
@@ -361,9 +371,9 @@ func TestConflictKnowledgeAcrossProjectsIntegration(t *testing.T) {
 			ProjectKey:  alpha,
 			ContentType: "insight",
 			Content:     "数据库选择 MySQL，兼容优先，便于迁移。",
-			Tags:        []string{"db", "mysql"},
+			Tags: strArrPtr("db", "mysql"),
 			Axes:        &MemoryAxes{Domain: []string{"backend"}, Problem: []string{"compatibility"}},
-			IndexPath:   []string{"decisions", "db", "primary"},
+			IndexPath:   strArrPtr("decisions", "db", "primary"),
 			SkipLLM:     true,
 			Ts:          now + 1,
 		},
@@ -373,9 +383,9 @@ func TestConflictKnowledgeAcrossProjectsIntegration(t *testing.T) {
 			ProjectKey:  beta,
 			ContentType: "insight",
 			Content:     "移动端数据库选择 SQLite，离线优先。",
-			Tags:        []string{"db", "sqlite"},
+			Tags: strArrPtr("db", "sqlite"),
 			Axes:        &MemoryAxes{Domain: []string{"mobile"}},
-			IndexPath:   []string{"decisions", "db", "edge"},
+			IndexPath:   strArrPtr("decisions", "db", "edge"),
 			SkipLLM:     true,
 			Ts:          now + 2,
 		},
@@ -385,9 +395,9 @@ func TestConflictKnowledgeAcrossProjectsIntegration(t *testing.T) {
 			ProjectKey:  gamma,
 			ContentType: "insight",
 			Content:     "缓存使用 Redis，数据库不用于缓存层。",
-			Tags:        []string{"cache", "redis"},
+			Tags: strArrPtr("cache", "redis"),
 			Axes:        &MemoryAxes{Domain: []string{"infra"}},
-			IndexPath:   []string{"decisions", "cache"},
+			IndexPath:   strArrPtr("decisions", "cache"),
 			SkipLLM:     true,
 			Ts:          now + 3,
 		},
@@ -399,11 +409,12 @@ func TestConflictKnowledgeAcrossProjectsIntegration(t *testing.T) {
 		}
 	}
 
+	fullMode := "full"
 	searchAll, err := app.SearchMemories(ctx, SearchInput{
 		OwnerID: "personal",
 		Query:   "数据库",
 		Scope:   "all",
-		Mode:    "full",
+		Mode:    &fullMode,
 		Limit:   20,
 	})
 	if err != nil {
@@ -426,7 +437,7 @@ func TestConflictKnowledgeAcrossProjectsIntegration(t *testing.T) {
 		ProjectKey:  alpha,
 		Query:       "数据库",
 		Scope:       "all",
-		Mode:        "full",
+		Mode:        &fullMode,
 		Limit:       20,
 	})
 	if err != nil {
@@ -449,12 +460,13 @@ func TestConflictKnowledgeAcrossProjectsIntegration(t *testing.T) {
 		t.Fatalf("冲突语义未同时命中: postgres=%v mysql=%v", hasPostgres, hasMySQL)
 	}
 
+	prefixIndexPath := []string{"decisions", "db"}
 	searchPrefix, err := app.SearchMemories(ctx, SearchInput{
 		OwnerID:   "personal",
 		Query:     "数据库",
 		Scope:     "all",
-		Mode:      "full",
-		IndexPath: []string{"decisions", "db"},
+		Mode:      &fullMode,
+		IndexPath: &prefixIndexPath,
 		Limit:     20,
 	})
 	if err != nil {
@@ -527,9 +539,9 @@ func TestRealChatLogsIntegration(t *testing.T) {
 			ProjectKey:  sample.ProjectKey,
 			ContentType: "insight",
 			Content:     marker + "\n" + content,
-			Tags:        []string{"chatlog", sample.Label},
+			Tags: strArrPtr("chatlog", sample.Label),
 			Axes:        &MemoryAxes{Domain: []string{"assistant"}},
-			IndexPath:   []string{"dialogs", sample.Label},
+			IndexPath:   strArrPtr("dialogs", sample.Label),
 			SkipLLM:     true,
 			Ts:          now + int64(idx),
 		}
@@ -538,14 +550,16 @@ func TestRealChatLogsIntegration(t *testing.T) {
 		}
 	}
 
+	modeFullPtr := "full"
 	for _, sample := range samples {
 		marker := "SOURCE " + strings.ToUpper(sample.Label)
+		sampleIndexPath := []string{"dialogs", sample.Label}
 		searchResp, err := app.SearchMemories(ctx, SearchInput{
 			OwnerID:   "personal",
 			Query:     marker,
 			Scope:     "all",
-			Mode:      "full",
-			IndexPath: []string{"dialogs", sample.Label},
+			Mode:      &modeFullPtr,
+			IndexPath: &sampleIndexPath,
 			Limit:     5,
 		})
 		if err != nil {
@@ -606,9 +620,9 @@ func TestMixedChatLogsSameProjectIntegration(t *testing.T) {
 			ProjectKey:  projectKey,
 			ContentType: "insight",
 			Content:     marker + "\n" + content,
-			Tags:        []string{"chatlog", "mixed", sample.Label},
+			Tags: strArrPtr("chatlog", "mixed", sample.Label),
 			Axes:        &MemoryAxes{Domain: []string{"assistant"}},
-			IndexPath:   []string{"dialogs", "mixed"},
+			IndexPath:   strArrPtr("dialogs", "mixed"),
 			SkipLLM:     true,
 			Ts:          now + int64(idx),
 		}
@@ -617,13 +631,14 @@ func TestMixedChatLogsSameProjectIntegration(t *testing.T) {
 		}
 	}
 
+	modeFull := "full"
 	searchResp, err := app.SearchMemories(ctx, SearchInput{
 		OwnerID:     "personal",
 		ProjectName: projectKey,
 		ProjectKey:  projectKey,
 		Query:       "MIXED SOURCE",
 		Scope:       "all",
-		Mode:        "full",
+		Mode:        &modeFull,
 		Limit:       10,
 	})
 	if err != nil {
@@ -676,9 +691,9 @@ func TestMixedConflictChatIntegration(t *testing.T) {
 			ProjectKey:  projectKey,
 			ContentType: "insight",
 			Content:     "冲突样本: 数据库选择 PostgreSQL，性能优先。",
-			Tags:        []string{"db", "postgresql"},
+			Tags: strArrPtr("db", "postgresql"),
 			Axes:        &MemoryAxes{Domain: []string{"backend"}},
-			IndexPath:   []string{"dialogs", "mixed", "conflict"},
+			IndexPath:   strArrPtr("dialogs", "mixed", "conflict"),
 			SkipLLM:     true,
 			Ts:          baseTs,
 		},
@@ -688,9 +703,9 @@ func TestMixedConflictChatIntegration(t *testing.T) {
 			ProjectKey:  projectKey,
 			ContentType: "insight",
 			Content:     "冲突样本: 数据库选择 MySQL，兼容优先。",
-			Tags:        []string{"db", "mysql"},
+			Tags: strArrPtr("db", "mysql"),
 			Axes:        &MemoryAxes{Domain: []string{"backend"}},
-			IndexPath:   []string{"dialogs", "mixed", "conflict"},
+			IndexPath:   strArrPtr("dialogs", "mixed", "conflict"),
 			SkipLLM:     true,
 			Ts:          baseTs + 1,
 		},
@@ -713,9 +728,9 @@ func TestMixedConflictChatIntegration(t *testing.T) {
 			ProjectKey:  projectKey,
 			ContentType: "insight",
 			Content:     marker + "\n" + content,
-			Tags:        []string{"chatlog", "mixed", sample.Label},
+			Tags: strArrPtr("chatlog", "mixed", sample.Label),
 			Axes:        &MemoryAxes{Domain: []string{"assistant"}},
-			IndexPath:   []string{"dialogs", "mixed", "logs"},
+			IndexPath:   strArrPtr("dialogs", "mixed", "logs"),
 			SkipLLM:     true,
 			Ts:          baseTs + 10 + int64(idx),
 		}
@@ -724,14 +739,16 @@ func TestMixedConflictChatIntegration(t *testing.T) {
 		}
 	}
 
+	modeFull := "full"
+	mixedIndexPath := []string{"dialogs", "mixed"}
 	searchResp, err := app.SearchMemories(ctx, SearchInput{
 		OwnerID:     "personal",
 		ProjectName: projectKey,
 		ProjectKey:  projectKey,
 		Query:       "数据库",
 		Scope:       "all",
-		Mode:        "full",
-		IndexPath:   []string{"dialogs", "mixed"},
+		Mode:        &modeFull,
+		IndexPath:   &mixedIndexPath,
 		Limit:       20,
 	})
 	if err != nil {
@@ -786,7 +803,7 @@ func TestIndexStatsEvolutionIntegration(t *testing.T) {
 			ProjectKey:  projectKey,
 			ContentType: "insight",
 			Content:     "root alpha one",
-			IndexPath:   []string{"root", "alpha"},
+			IndexPath:   strArrPtr("root", "alpha"),
 			SkipLLM:     true,
 			Ts:          baseTs,
 		},
@@ -796,7 +813,7 @@ func TestIndexStatsEvolutionIntegration(t *testing.T) {
 			ProjectKey:  projectKey,
 			ContentType: "insight",
 			Content:     "root alpha child",
-			IndexPath:   []string{"root", "alpha", "child"},
+			IndexPath:   strArrPtr("root", "alpha", "child"),
 			SkipLLM:     true,
 			Ts:          baseTs + 1,
 		},
@@ -811,7 +828,7 @@ func TestIndexStatsEvolutionIntegration(t *testing.T) {
 		OwnerID:       "personal",
 		ProjectName:   projectKey,
 		ProjectKey:    projectKey,
-		IndexPath:     []string{"root"},
+		IndexPath:     strArrPtr("root"),
 		Limit:         50,
 		PathTreeDepth: 3,
 		PathTreeWidth: 10,
@@ -834,7 +851,7 @@ func TestIndexStatsEvolutionIntegration(t *testing.T) {
 			ProjectKey:  projectKey,
 			ContentType: "insight",
 			Content:     "root beta",
-			IndexPath:   []string{"root", "beta"},
+			IndexPath:   strArrPtr("root", "beta"),
 			SkipLLM:     true,
 			Ts:          baseTs + 2,
 		},
@@ -844,7 +861,7 @@ func TestIndexStatsEvolutionIntegration(t *testing.T) {
 			ProjectKey:  projectKey,
 			ContentType: "insight",
 			Content:     "root gamma child",
-			IndexPath:   []string{"root", "gamma", "child"},
+			IndexPath:   strArrPtr("root", "gamma", "child"),
 			SkipLLM:     true,
 			Ts:          baseTs + 3,
 		},
@@ -859,7 +876,7 @@ func TestIndexStatsEvolutionIntegration(t *testing.T) {
 		OwnerID:       "personal",
 		ProjectName:   projectKey,
 		ProjectKey:    projectKey,
-		IndexPath:     []string{"root"},
+		IndexPath:     strArrPtr("root"),
 		Limit:         50,
 		PathTreeDepth: 3,
 		PathTreeWidth: 10,
@@ -906,7 +923,7 @@ func TestMetricsIntegration(t *testing.T) {
 			ProjectKey:  projectKey,
 			ContentType: "insight",
 			Content:     "metrics alpha",
-			IndexPath:   []string{"root", "alpha"},
+			IndexPath:   strArrPtr("root", "alpha"),
 			SkipLLM:     true,
 			Ts:          baseTs,
 		},
@@ -916,7 +933,7 @@ func TestMetricsIntegration(t *testing.T) {
 			ProjectKey:  projectKey,
 			ContentType: "insight",
 			Content:     "metrics beta",
-			IndexPath:   []string{"root", "beta"},
+			IndexPath:   strArrPtr("root", "beta"),
 			SkipLLM:     true,
 			Ts:          baseTs + 1,
 		},
@@ -931,7 +948,7 @@ func TestMetricsIntegration(t *testing.T) {
 		OwnerID:       "personal",
 		ProjectName:   projectKey,
 		ProjectKey:    projectKey,
-		IndexPath:     []string{"root"},
+		IndexPath:     strArrPtr("root"),
 		Limit:         20,
 		PathTreeDepth: 2,
 		PathTreeWidth: 10,
@@ -981,7 +998,7 @@ func TestMetricsCacheIntegration(t *testing.T) {
 		ProjectKey:  projectKey,
 		ContentType: "insight",
 		Content:     "metrics cache sample",
-		IndexPath:   []string{"root", "cache"},
+		IndexPath:   strArrPtr("root", "cache"),
 		SkipLLM:     true,
 		Ts:          baseTs,
 	}); err != nil {
@@ -992,7 +1009,7 @@ func TestMetricsCacheIntegration(t *testing.T) {
 		OwnerID:       "personal",
 		ProjectName:   projectKey,
 		ProjectKey:    projectKey,
-		IndexPath:     []string{"root"},
+		IndexPath:     strArrPtr("root"),
 		Limit:         20,
 		PathTreeDepth: 2,
 		PathTreeWidth: 10,

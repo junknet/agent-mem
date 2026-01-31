@@ -29,11 +29,12 @@ func normalizeIngestInput(input IngestMemoryInput, settings Settings, now time.T
 	input.MachineName = strings.TrimSpace(input.MachineName)
 	input.ProjectPath = strings.TrimSpace(input.ProjectPath)
 	input.Summary = strings.TrimSpace(input.Summary)
-	if len(input.Tags) > 0 {
-		input.Tags = normalizeTags(input.Tags)
+	if input.Tags != nil && len(*input.Tags) > 0 {
+		normalized := normalizeTags(*input.Tags)
+		input.Tags = &normalized
 	}
 	input.Axes = normalizeAxesInput(input.Axes)
-	input.IndexPath = normalizeIndexPath(input.IndexPath)
+	input.IndexPath = normalizeIndexPathPtr(input.IndexPath)
 
 	if input.Ts <= 0 {
 		input.Ts = now.Unix()
@@ -63,10 +64,10 @@ func normalizeSearchInput(input SearchInput, settings Settings) (SearchInput, er
 	if input.Scope == "" {
 		input.Scope = "all"
 	}
-	input.Profile = normalizeSearchProfile(input.Profile)
-	input.Mode = normalizeSearchMode(input.Mode)
+	input.Profile = normalizeSearchProfilePtr(input.Profile)
+	input.Mode = normalizeSearchModePtr(input.Mode)
 	input.Axes = normalizeAxesInput(input.Axes)
-	input.IndexPath = normalizeIndexPath(input.IndexPath)
+	input.IndexPath = normalizeIndexPathPtr(input.IndexPath)
 	if input.Limit <= 0 {
 		input.Limit = defaultSearchLimit
 	}
@@ -129,7 +130,7 @@ func normalizeIndexInput(input IndexInput, settings Settings) (IndexInput, error
 		input.ProjectKey = projectKey
 		input.ProjectName = projectName
 	}
-	input.IndexPath = normalizeIndexPath(input.IndexPath)
+	input.IndexPath = normalizeIndexPathPtr(input.IndexPath)
 
 	if input.Limit <= 0 {
 		input.Limit = defaultIndexLimit
@@ -216,4 +217,32 @@ func resolveProjectIdentity(projectName, projectKey, projectPath string) (string
 
 func hasProjectSelector(projectName, projectKey, projectPath string) bool {
 	return strings.TrimSpace(projectName) != "" || strings.TrimSpace(projectKey) != "" || strings.TrimSpace(projectPath) != ""
+}
+
+// 指针类型辅助函数（支持 null 值）
+
+func normalizeSearchProfilePtr(value *string) *string {
+	var v string
+	if value != nil {
+		v = *value
+	}
+	result := normalizeSearchProfile(v)
+	return &result
+}
+
+func normalizeSearchModePtr(value *string) *string {
+	var v string
+	if value != nil {
+		v = *value
+	}
+	result := normalizeSearchMode(v)
+	return &result
+}
+
+func normalizeIndexPathPtr(value *[]string) *[]string {
+	if value == nil {
+		return nil
+	}
+	result := normalizeIndexPath(*value)
+	return &result
 }

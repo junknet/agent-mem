@@ -44,9 +44,12 @@ func (s *Searcher) Search(ctx context.Context, input SearchInput) (SearchRespons
 	if input.Axes != nil {
 		axes = *input.Axes
 	}
-	indexPath := input.IndexPath
-	profile := normalizeSearchProfile(input.Profile)
-	mode := normalizeSearchMode(input.Mode)
+	var indexPath []string
+	if input.IndexPath != nil {
+		indexPath = *input.IndexPath
+	}
+	profile := derefString(input.Profile, "deep")
+	mode := derefString(input.Mode, "compact")
 
 	projectScoped := strings.TrimSpace(input.ProjectKey) != ""
 	projectID := ""
@@ -499,4 +502,11 @@ func normalizeQuery(query string) string {
 		}
 	}
 	return strings.TrimSpace(builder.String())
+}
+
+func derefString(ptr *string, defaultVal string) string {
+	if ptr == nil {
+		return defaultVal
+	}
+	return *ptr
 }

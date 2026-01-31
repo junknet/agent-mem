@@ -306,8 +306,12 @@ func (a *App) Index(ctx context.Context, input IndexInput) (IndexResponse, error
 	}
 
 	limit := normalized.Limit
+	var indexPath []string
+	if normalized.IndexPath != nil {
+		indexPath = *normalized.IndexPath
+	}
 	axes := []IndexAxis{}
-	tagCounts, err := a.store.FetchTagCounts(ctx, projectID, normalized.OwnerID, limit, normalized.IndexPath)
+	tagCounts, err := a.store.FetchTagCounts(ctx, projectID, normalized.OwnerID, limit, indexPath)
 	if err != nil {
 		return IndexResponse{}, err
 	}
@@ -317,7 +321,7 @@ func (a *App) Index(ctx context.Context, input IndexInput) (IndexResponse, error
 
 	axisNames := []string{"domain", "stack", "problem", "lifecycle", "component"}
 	for _, axis := range axisNames {
-		values, err := a.store.FetchAxisCounts(ctx, projectID, normalized.OwnerID, axis, limit, normalized.IndexPath)
+		values, err := a.store.FetchAxisCounts(ctx, projectID, normalized.OwnerID, axis, limit, indexPath)
 		if err != nil {
 			return IndexResponse{}, err
 		}
@@ -326,25 +330,25 @@ func (a *App) Index(ctx context.Context, input IndexInput) (IndexResponse, error
 		}
 	}
 
-	paths, err := a.store.FetchIndexPaths(ctx, projectID, normalized.OwnerID, limit, normalized.IndexPath)
+	paths, err := a.store.FetchIndexPaths(ctx, projectID, normalized.OwnerID, limit, indexPath)
 	if err != nil {
 		return IndexResponse{}, err
 	}
 	pathsForTree := paths
-	if len(normalized.IndexPath) > 0 {
-		pathsForTree = trimIndexPathCounts(paths, normalized.IndexPath)
+	if len(indexPath) > 0 {
+		pathsForTree = trimIndexPathCounts(paths, indexPath)
 	}
 	pathTree := buildIndexPathTree(pathsForTree, normalized.PathTreeDepth, normalized.PathTreeWidth)
 
-	counts, err := a.store.FetchMemoryCounts(ctx, projectID, normalized.OwnerID, normalized.IndexPath)
+	counts, err := a.store.FetchMemoryCounts(ctx, projectID, normalized.OwnerID, indexPath)
 	if err != nil {
 		return IndexResponse{}, err
 	}
-	depthDist, err := a.store.FetchIndexPathDepthDistribution(ctx, projectID, normalized.OwnerID, normalized.IndexPath)
+	depthDist, err := a.store.FetchIndexPathDepthDistribution(ctx, projectID, normalized.OwnerID, indexPath)
 	if err != nil {
 		return IndexResponse{}, err
 	}
-	stats := buildIndexStats(counts, depthDist, pathTree, len(normalized.IndexPath))
+	stats := buildIndexStats(counts, depthDist, pathTree, len(indexPath))
 
 	total := len(axes) + len(paths)
 	return IndexResponse{

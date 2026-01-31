@@ -103,8 +103,8 @@ func handleSearchMemories(w http.ResponseWriter, r *http.Request, app *App) {
 		ProjectPath: strings.TrimSpace(r.URL.Query().Get("project_path")),
 		Query:       strings.TrimSpace(r.URL.Query().Get("query")),
 		Scope:       strings.TrimSpace(r.URL.Query().Get("scope")),
-		Profile:     strings.TrimSpace(r.URL.Query().Get("profile")),
-		Mode:        strings.TrimSpace(r.URL.Query().Get("mode")),
+		Profile:     strPtr(strings.TrimSpace(r.URL.Query().Get("profile"))),
+		Mode:        strPtr(strings.TrimSpace(r.URL.Query().Get("mode"))),
 	}
 	axes, err := parseAxesQuery(r.URL.Query().Get("axes"))
 	if err != nil {
@@ -119,7 +119,9 @@ func handleSearchMemories(w http.ResponseWriter, r *http.Request, app *App) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "index_path 参数格式错误", "ERR_INVALID_INDEX_PATH")
 		return
 	}
-	payload.IndexPath = indexPath
+	if indexPath != nil {
+		payload.IndexPath = &indexPath
+	}
 	limit, err := parseOptionalInt(r.URL.Query().Get("limit"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), "ERR_INVALID_LIMIT")
@@ -241,12 +243,14 @@ func handleIndex(w http.ResponseWriter, r *http.Request, app *App) {
 		MachineName: strings.TrimSpace(r.URL.Query().Get("machine_name")),
 		ProjectPath: strings.TrimSpace(r.URL.Query().Get("project_path")),
 	}
-	indexPath, err := parseIndexPathQuery(r.URL.Query()["index_path"])
+	indexPathArr, err := parseIndexPathQuery(r.URL.Query()["index_path"])
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", "index_path 参数格式错误", "ERR_INVALID_INDEX_PATH")
 		return
 	}
-	payload.IndexPath = indexPath
+	if indexPathArr != nil {
+		payload.IndexPath = &indexPathArr
+	}
 	limit, err := parseOptionalInt(r.URL.Query().Get("limit"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), "ERR_INVALID_LIMIT")
@@ -296,12 +300,14 @@ func handleMetrics(w http.ResponseWriter, r *http.Request, app *App) {
 		MachineName: strings.TrimSpace(r.URL.Query().Get("machine_name")),
 		ProjectPath: strings.TrimSpace(r.URL.Query().Get("project_path")),
 	}
-	indexPath, err := parseIndexPathQuery(r.URL.Query()["index_path"])
+	metricsIndexPath, err := parseIndexPathQuery(r.URL.Query()["index_path"])
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", "index_path 参数格式错误", "ERR_INVALID_INDEX_PATH")
 		return
 	}
-	payload.IndexPath = indexPath
+	if metricsIndexPath != nil {
+		payload.IndexPath = &metricsIndexPath
+	}
 	limit, err := parseOptionalInt(r.URL.Query().Get("limit"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), "ERR_INVALID_LIMIT")
@@ -541,4 +547,11 @@ func handleRollback(w http.ResponseWriter, r *http.Request, app *App) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func strPtr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

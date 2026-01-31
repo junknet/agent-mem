@@ -12,6 +12,7 @@ func TestNormalizeAxesAndIndexPath(t *testing.T) {
 		Stack:   []string{"Go", "go"},
 		Problem: []string{"  性能  "},
 	}
+	indexPath := []string{" 项目 ", "", "模块"}
 	input := IngestMemoryInput{
 		OwnerID:     "personal",
 		ProjectKey:  "test-project",
@@ -19,7 +20,7 @@ func TestNormalizeAxesAndIndexPath(t *testing.T) {
 		ContentType: "development",
 		Content:     "test content",
 		Axes:        axes,
-		IndexPath:   []string{" 项目 ", "", "模块"},
+		IndexPath:   &indexPath,
 	}
 	settings := defaultSettings()
 	normalized, err := normalizeIngestInput(input, settings, time.Date(2026, 1, 30, 0, 0, 0, 0, time.UTC))
@@ -32,7 +33,7 @@ func TestNormalizeAxesAndIndexPath(t *testing.T) {
 	if normalized.Axes.Domain[0] != "ai" {
 		t.Fatalf("axes 未小写化: %+v", normalized.Axes.Domain)
 	}
-	if len(normalized.IndexPath) != 2 || normalized.IndexPath[0] != "项目" || normalized.IndexPath[1] != "模块" {
+	if normalized.IndexPath == nil || len(*normalized.IndexPath) != 2 || (*normalized.IndexPath)[0] != "项目" || (*normalized.IndexPath)[1] != "模块" {
 		t.Fatalf("index_path 归一化失败: %+v", normalized.IndexPath)
 	}
 }
@@ -66,7 +67,7 @@ func TestValidateIndexPathTooDeep(t *testing.T) {
 		ProjectName: "p",
 		Query:       "test query",
 		Scope:       "all",
-		IndexPath:   path,
+		IndexPath:   &path,
 	}
 	if err := validateSearchInput(input); err == nil {
 		t.Fatalf("预期 index_path 过深应报错")

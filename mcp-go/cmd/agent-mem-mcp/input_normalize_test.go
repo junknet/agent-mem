@@ -65,11 +65,11 @@ func TestNormalizeSearchInputDefaults(t *testing.T) {
 	if normalized.Limit != defaultSearchLimit {
 		t.Fatalf("limit 默认值错误: %d", normalized.Limit)
 	}
-	if normalized.Profile != "deep" {
-		t.Fatalf("profile 默认值错误: %s", normalized.Profile)
+	if normalized.Profile == nil || *normalized.Profile != "deep" {
+		t.Fatalf("profile 默认值错误: %v", normalized.Profile)
 	}
-	if normalized.Mode != "compact" {
-		t.Fatalf("mode 默认值错误: %s", normalized.Mode)
+	if normalized.Mode == nil || *normalized.Mode != "compact" {
+		t.Fatalf("mode 默认值错误: %v", normalized.Mode)
 	}
 }
 
@@ -88,16 +88,17 @@ func TestResolveProjectIdentityFromPath(t *testing.T) {
 
 func TestNormalizeIndexInputIndexPath(t *testing.T) {
 	settings := defaultSettings()
+	indexPath := []string{" Root ", "Sub"}
 	input := IndexInput{
 		OwnerID:   "personal",
 		Limit:     10,
-		IndexPath: []string{" Root ", "Sub"},
+		IndexPath: &indexPath,
 	}
 	normalized, err := normalizeIndexInput(input, settings)
 	if err != nil {
 		t.Fatalf("归一化失败: %v", err)
 	}
-	if len(normalized.IndexPath) != 2 || normalized.IndexPath[0] != "root" || normalized.IndexPath[1] != "sub" {
+	if normalized.IndexPath == nil || len(*normalized.IndexPath) != 2 || (*normalized.IndexPath)[0] != "root" || (*normalized.IndexPath)[1] != "sub" {
 		t.Fatalf("index_path 归一化失败: %+v", normalized.IndexPath)
 	}
 }
