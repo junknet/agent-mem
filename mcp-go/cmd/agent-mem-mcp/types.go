@@ -6,8 +6,8 @@ type IngestMemoryInput struct {
 	OwnerID     string      `json:"owner_id"`
 	ProjectKey  string      `json:"project_key"`
 	ProjectName string      `json:"project_name"`
-	MachineName string      `json:"machine_name"`
-	ProjectPath string      `json:"project_path"`
+	MachineName string      `json:"machine_name,omitempty"`
+	ProjectPath string      `json:"project_path,omitempty"`
 	ContentType string      `json:"content_type"`
 	Content     string      `json:"content"`
 	Summary     string      `json:"summary,omitempty"`
@@ -28,8 +28,8 @@ type SearchInput struct {
 	OwnerID     string      `json:"owner_id"`
 	ProjectKey  string      `json:"project_key"`
 	ProjectName string      `json:"project_name"`
-	MachineName string      `json:"machine_name"`
-	ProjectPath string      `json:"project_path"`
+	MachineName string      `json:"machine_name,omitempty"`
+	ProjectPath string      `json:"project_path,omitempty"`
 	Query       string      `json:"query"`
 	Scope       string      `json:"scope"`
 	Profile     *string     `json:"profile,omitempty"`
@@ -86,10 +86,10 @@ type GetMemoriesResponse struct {
 
 type TimelineInput struct {
 	OwnerID     string `json:"owner_id"`
-	ProjectKey  string `json:"project_key"`
-	ProjectName string `json:"project_name"`
-	MachineName string `json:"machine_name"`
-	ProjectPath string `json:"project_path"`
+	ProjectKey  string `json:"project_key,omitempty"`
+	ProjectName string `json:"project_name,omitempty"`
+	MachineName string `json:"machine_name,omitempty"`
+	ProjectPath string `json:"project_path,omitempty"`
 	Days        int    `json:"days"`
 	Limit       int    `json:"limit"`
 }
@@ -228,14 +228,14 @@ type SearchTrace struct {
 
 type IndexInput struct {
 	OwnerID       string    `json:"owner_id"`
-	ProjectKey    string    `json:"project_key"`
-	ProjectName   string    `json:"project_name"`
-	MachineName   string    `json:"machine_name"`
-	ProjectPath   string    `json:"project_path"`
+	ProjectKey    string    `json:"project_key,omitempty"`
+	ProjectName   string    `json:"project_name,omitempty"`
+	MachineName   string    `json:"machine_name,omitempty"`
+	ProjectPath   string    `json:"project_path,omitempty"`
 	Limit         int       `json:"limit"`
-	IndexPath     *[]string `json:"index_path"`
-	PathTreeDepth int       `json:"path_tree_depth"`
-	PathTreeWidth int       `json:"path_tree_width"`
+	IndexPath     *[]string `json:"index_path,omitempty"`
+	PathTreeDepth int       `json:"path_tree_depth,omitempty"`
+	PathTreeWidth int       `json:"path_tree_width,omitempty"`
 }
 
 type AxisCount struct {
