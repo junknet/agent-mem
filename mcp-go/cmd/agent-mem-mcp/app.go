@@ -51,36 +51,106 @@ func (a *App) EnsureSchema(ctx context.Context, reset bool) error {
 
 func buildServer(app *App) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{Name: "agent-mem", Version: "1.0.0"}, &mcp.ServerOptions{
-		Instructions: "这是云记忆中心 MCP 服务。严格流程：mem.search -> mem.get，写入使用 mem.ingest_memory。",
+		Instructions: `云记忆中心 MCP 服务 - AI 知识库
+
+## 核心流程
+1. 检索：mem.search → mem.get（两阶段）
+2. 写入：mem.ingest_memory
+3. 时间线：mem.timeline（查最新）
+
+## 何时检索（mem.search）
+- 用户提到"之前/上次/我们讨论过"
+- 问项目设计/决策/规范问题
+- 问"最新/现在/最终方案"
+- 开始开发任务前
+
+## 何时写入（mem.ingest_memory）
+- 确定需求、设计架构、架构变更
+- 核心代码实现、开发规范、配置说明
+- 测试策略、Bug记录、踩坑总结
+
+## content_type 五种类型
+- requirement: 需求、业务规则
+- plan: 架构设计、技术方案
+- development: 代码实现、API设计、规范
+- testing: 测试策略、Bug记录
+- insight: 经验总结、技术决策
+
+## 必需参数
+- owner_id: 固定 "personal"
+- project_key: 从工作目录提取`,
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "mem.ingest_memory",
-		Description: "写入记忆",
+		Name: "mem.ingest_memory",
+		Description: `写入记忆到知识库。
+
+**何时调用**：
+- 确定需求边界、业务规则
+- 设计架构方案、架构变更
+- 核心代码实现、API设计
+- 开发规范、配置说明
+- 测试策略、Bug记录
+- 踩坑总结、技术决策
+
+**content_type 选择**：
+- requirement: 需求、业务规则、验收标准
+- plan: 架构设计、技术方案、实现计划
+- development: 代码实现、API设计、开发规范
+- testing: 测试策略、Bug记录、性能报告
+- insight: 经验总结、技术决策、复盘
+
+**必需参数**：owner_id=personal, content_type, content`,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in IngestMemoryInput) (*mcp.CallToolResult, IngestMemoryOutput, error) {
 		output, err := app.IngestMemoryTool(ctx, in)
 		return nil, output, err
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "mem.search",
-		Description: "片段检索（第一阶段）",
+		Name: "mem.search",
+		Description: `语义检索记忆（第一阶段，返回摘要）。
+
+**何时调用**：
+- 用户提到"之前/上次/我们讨论过"
+- 问项目设计/决策/规范问题
+- 问"最新/现在/最终方案"
+- 开始新开发任务前
+
+**流程**：mem.search → 拿到 ID → mem.get 获取完整内容
+
+**参数**：
+- owner_id: 固定 "personal"
+- query: 搜索关键词
+- scope: 可选，过滤 content_type
+- limit: 返回数量，默认 20`,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in SearchInput) (*mcp.CallToolResult, SearchResponse, error) {
 		output, err := app.SearchMemories(ctx, in)
 		return nil, output, err
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "mem.get",
-		Description: "获取完整内容（第二阶段）",
+		Name: "mem.get",
+		Description: `获取记忆完整内容（第二阶段）。
+
+**调用时机**：在 mem.search 返回结果后，用 ID 获取完整内容。
+
+**参数**：ids - 从 mem.search 结果中获取的记忆 ID 列表`,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in GetMemoriesInput) (*mcp.CallToolResult, GetMemoriesResponse, error) {
 		output, err := app.GetMemories(ctx, in.IDs)
 		return nil, output, err
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "mem.timeline",
-		Description: "时间线查询",
+		Name: "mem.timeline",
+		Description: `按时间线查询最近记忆。
+
+**何时调用**：用户问"最新/现在/最终/最近"相关问题。
+
+**参数**：
+- owner_id: 固定 "personal"
+- project_key: 可选，限定项目
+- days: 查询天数，默认 7
+- limit: 返回数量，默认 20`,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in TimelineInput) (*mcp.CallToolResult, TimelineResponse, error) {
 		output, err := app.Timeline(ctx, in)
 		return nil, output, err
@@ -88,7 +158,7 @@ func buildServer(app *App) *mcp.Server {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "mem.list_projects",
-		Description: "项目列表",
+		Description: "列出所有项目及其记忆统计。参数：owner_id=personal",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in ListProjectsInput) (*mcp.CallToolResult, ListProjectsResponse, error) {
 		output, err := app.ListProjects(ctx, in)
 		return nil, output, err
@@ -96,7 +166,7 @@ func buildServer(app *App) *mcp.Server {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "mem.index",
-		Description: "纵横索引概览（标签/轴/路径聚合）",
+		Description: "纵横索引概览（标签/轴/路径聚合），用于浏览知识结构",
 		OutputSchema: map[string]any{
 			"type": "object",
 		},
@@ -107,7 +177,7 @@ func buildServer(app *App) *mcp.Server {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "mem.metrics",
-		Description: "索引可观测指标（Prometheus 格式）",
+		Description: "索引可观测指标（Prometheus 格式），用于系统监控",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in IndexInput) (*mcp.CallToolResult, MetricsResponse, error) {
 		output, err := app.Metrics(ctx, in)
 		return nil, output, err
@@ -115,7 +185,7 @@ func buildServer(app *App) *mcp.Server {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "mem.arbitration_history",
-		Description: "查询仲裁历史（记忆更新/替换的决策记录）",
+		Description: "查询仲裁历史（记忆更新/替换的决策记录：REPLACE/KEEP_BOTH/SKIP）",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in ArbitrationHistoryInput) (*mcp.CallToolResult, ArbitrationHistoryResponse, error) {
 		output, err := app.ArbitrationHistory(ctx, in)
 		return nil, output, err
