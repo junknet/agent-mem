@@ -27,7 +27,9 @@ def test_streamable_http(host: str, port: int, token: str) -> bool:
     }
     session_id = None
 
-    def post(payload: dict, sid: str | None = None) -> tuple[int, dict | None, str | None]:
+    def post(
+        payload: dict, sid: str | None = None
+    ) -> tuple[int, dict | None, str | None]:
         conn = http.client.HTTPConnection(host, port, timeout=15)
         h = dict(headers_base)
         if sid:
@@ -46,14 +48,18 @@ def test_streamable_http(host: str, port: int, token: str) -> bool:
             return resp.status, None, resp_sid
 
     # 1. Initialize
-    status, data, session_id = post({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "test", "version": "1.0"},
-        },
-    })
+    status, data, session_id = post(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "1.0"},
+            },
+        }
+    )
     if status != 200 or not session_id:
         print(f"  FAIL: initialize returned {status}, sid={session_id}")
         return False
@@ -85,13 +91,22 @@ def test_streamable_http(host: str, port: int, token: str) -> bool:
 
     # 4. tools/call — mem.search
     status4, data4, _ = post(
-        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
-            "name": "mem.search",
-            "arguments": {
-                "query": "test", "owner_id": "personal", "scope": "all",
-                "project_key": "test", "project_name": "test", "limit": 5,
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "mem.search",
+                "arguments": {
+                    "query": "test",
+                    "owner_id": "personal",
+                    "scope": "all",
+                    "project_key": "test",
+                    "project_name": "test",
+                    "limit": 5,
+                },
             },
-        }},
+        },
         sid=session_id,
     )
     if status4 != 200 or not data4 or "error" in data4:
@@ -109,13 +124,15 @@ def test_sse(host: str, port: int, token: str) -> bool:
     print("\n=== SSE (/sse) ===")
 
     result_queue: queue.Queue = queue.Queue()
-    endpoint = None
+    endpoint: str = ""
     endpoint_event = threading.Event()
 
     def sse_listener():
         nonlocal endpoint
         conn = http.client.HTTPConnection(host, port, timeout=30)
-        conn.request("GET", f"/sse?token={token}", headers={"Accept": "text/event-stream"})
+        conn.request(
+            "GET", f"/sse?token={token}", headers={"Accept": "text/event-stream"}
+        )
         resp = conn.getresponse()
         event_type = None
         while True:
@@ -136,18 +153,29 @@ def test_sse(host: str, port: int, token: str) -> bool:
 
     t = threading.Thread(target=sse_listener, daemon=True)
     t.start()
-    if not endpoint_event.wait(timeout=10):
+    if not endpoint_event.wait(timeout=10) or not endpoint:
         print("  FAIL: no SSE endpoint received")
         return False
     print(f"  SSE endpoint: {endpoint[:40]}...")
 
     msg_id = 0
 
-    def post_msg(payload: dict) -> dict | None:
+    def post_msg(payload: dict, add_token: bool = False) -> dict | None:
         nonlocal msg_id
         conn = http.client.HTTPConnection(host, port, timeout=15)
-        url = f"{endpoint}&token={token}" if "?" in endpoint else f"{endpoint}?token={token}"
-        conn.request("POST", url, json.dumps(payload).encode(), {"Content-Type": "application/json"})
+        url: str = endpoint
+        if add_token and token:
+            url = (
+                f"{endpoint}&token={token}"
+                if "?" in endpoint
+                else f"{endpoint}?token={token}"
+            )
+        conn.request(
+            "POST",
+            url,
+            json.dumps(payload).encode(),
+            {"Content-Type": "application/json"},
+        )
         resp = conn.getresponse()
         resp.read()
         conn.close()
@@ -160,14 +188,18 @@ def test_sse(host: str, port: int, token: str) -> bool:
 
     # 1. Initialize
     msg_id += 1
-    r = post_msg({
-        "jsonrpc": "2.0", "id": msg_id, "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "test-sse", "version": "1.0"},
-        },
-    })
+    r = post_msg(
+        {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "test-sse", "version": "1.0"},
+            },
+        }
+    )
     if not r or "result" not in r:
         print(f"  FAIL: initialize: {r}")
         return False
@@ -189,16 +221,24 @@ def test_sse(host: str, port: int, token: str) -> bool:
 
     # 4. mem.search
     msg_id += 1
-    r3 = post_msg({
-        "jsonrpc": "2.0", "id": msg_id, "method": "tools/call",
-        "params": {
-            "name": "mem.search",
-            "arguments": {
-                "query": "test", "owner_id": "personal", "scope": "all",
-                "project_key": "test", "project_name": "test", "limit": 5,
+    r3 = post_msg(
+        {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "method": "tools/call",
+            "params": {
+                "name": "mem.search",
+                "arguments": {
+                    "query": "test",
+                    "owner_id": "personal",
+                    "scope": "all",
+                    "project_key": "test",
+                    "project_name": "test",
+                    "limit": 5,
+                },
             },
-        },
-    })
+        }
+    )
     if not r3 or "error" in r3:
         err = r3.get("error", {}).get("message", "") if r3 else "timeout"
         print(f"  FAIL: mem.search: {err}")
@@ -207,22 +247,26 @@ def test_sse(host: str, port: int, token: str) -> bool:
 
     # 5. mem.ingest_memory
     msg_id += 1
-    r4 = post_msg({
-        "jsonrpc": "2.0", "id": msg_id, "method": "tools/call",
-        "params": {
-            "name": "mem.ingest_memory",
-            "arguments": {
-                "owner_id": "personal",
-                "project_key": "_test_transport",
-                "project_name": "Transport Test",
-                "project_path": "/tmp/test",
-                "content": f"Transport test at {time.strftime('%Y-%m-%d %H:%M:%S')}",
-                "content_type": "testing",
-                "tags": ["_test", "transport"],
-                "ts": int(time.time()),
+    r4 = post_msg(
+        {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "method": "tools/call",
+            "params": {
+                "name": "mem.ingest_memory",
+                "arguments": {
+                    "owner_id": "personal",
+                    "project_key": "_test_transport",
+                    "project_name": "Transport Test",
+                    "project_path": "/tmp/test",
+                    "content": f"Transport test at {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                    "content_type": "testing",
+                    "tags": ["_test", "transport"],
+                    "ts": int(time.time()),
+                },
             },
-        },
-    })
+        }
+    )
     if not r4 or "error" in r4:
         err = r4.get("error", {}).get("message", "") if r4 else "timeout"
         print(f"  FAIL: mem.ingest: {err}")
