@@ -127,6 +127,42 @@ func (s *Searcher) Search(ctx context.Context, input SearchInput) (SearchRespons
 		sources = append(sources, SourceRows{Name: "vector", Rows: vectorRows})
 	}
 
+	// 前瞻记忆搜索：搜索 foresight 向量，将命中的 source_memory_id 对应片段加入结果集
+	if err == nil && s.embedder != nil && s.embedder.provider != "mock" {
+		var foresightMemoryIDs []string
+		if projectScoped {
+			foresightRows, fErr := s.store.SearchForesightVectors(ctx, vector, projectID, limit)
+			if fErr == nil {
+				seen := map[string]bool{}
+				for _, fr := range foresightRows {
+					if !seen[fr.SourceMemoryID] {
+						seen[fr.SourceMemoryID] = true
+						foresightMemoryIDs = append(foresightMemoryIDs, fr.SourceMemoryID)
+					}
+				}
+			}
+		} else {
+			foresightRows, fErr := s.store.SearchForesightVectorsByOwner(ctx, vector, input.OwnerID, limit)
+			if fErr == nil {
+				seen := map[string]bool{}
+				for _, fr := range foresightRows {
+					if !seen[fr.SourceMemoryID] {
+						seen[fr.SourceMemoryID] = true
+						foresightMemoryIDs = append(foresightMemoryIDs, fr.SourceMemoryID)
+					}
+				}
+			}
+		}
+		if len(foresightMemoryIDs) > 0 {
+			foresightFragments, fErr := s.store.FetchTopFragmentsByMemoryIDs(ctx, foresightMemoryIDs)
+			if fErr == nil && len(foresightFragments) > 0 {
+				sources = append(sources, SourceRows{Name: "foresight", Rows: foresightFragments})
+			}
+		}
+		// lazy cleanup 过期前瞻
+		_, _ = s.store.CleanExpiredForesights(ctx)
+	}
+
 	useExpand := s.settings.QueryExpand.Enabled && s.llm != nil
 	if useExpand && s.llm.mock {
 		useExpand = false
@@ -233,6 +269,10 @@ func (s *Searcher) Search(ctx context.Context, input SearchInput) (SearchRespons
 		}
 		results = append(results, result)
 	}
+
+	// 对 top 5 结果附带 outgoing 关系的 target memory ID 列表
+	enrichRelatedIDs(ctx, s.store, results)
+
 	return SearchResponse{
 		Results: results,
 		Metadata: SearchMetadata{
@@ -337,6 +377,8 @@ func rrfWeight(name string) float64 {
 		return 1.0
 	case "bm25":
 		return 1.0
+	case "foresight":
+		return 0.6
 	default:
 		return 1.0
 	}
@@ -509,4 +551,28 @@ func derefString(ptr *string, defaultVal string) string {
 		return defaultVal
 	}
 	return *ptr
+}
+
+// enrichRelatedIDs 对 top 5 结果附带 outgoing 关系的 target memory ID 列表
+func enrichRelatedIDs(ctx context.Context, store *Store, results []SearchResult) {
+	topN := 5
+	if len(results) < topN {
+		topN = len(results)
+	}
+	if topN == 0 {
+		return
+	}
+	ids := make([]string, 0, topN)
+	for i := 0; i < topN; i++ {
+		ids = append(ids, results[i].ID)
+	}
+	relMap, err := store.FetchOutgoingRelationTargets(ctx, ids, 10)
+	if err != nil {
+		return // best-effort，不影响搜索结果
+	}
+	for i := 0; i < topN; i++ {
+		if targets, ok := relMap[results[i].ID]; ok && len(targets) > 0 {
+			results[i].RelatedIDs = targets
+		}
+	}
 }

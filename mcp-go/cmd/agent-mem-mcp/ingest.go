@@ -225,6 +225,10 @@ func (a *App) IngestMemory(ctx context.Context, input IngestMemoryInput) (Ingest
 		if err := deleteFragmentsTx(ctx, tx, memoryID); err != nil {
 			return IngestResult{}, fmt.Errorf("清理旧片段失败: %w", err)
 		}
+		// REPLACE 时自动创建 DERIVED_FROM 关系（best-effort，跳过自引用）
+		if memoryID != semanticTargetID {
+			insertRelationTx(ctx, tx, memoryID, semanticTargetID, "DERIVED_FROM", 1.0)
+		}
 	} else {
 		if semanticTargetID != "" {
 			if err := insertArbitrationLogTx(ctx, tx, ArbitrationLogInsert{
@@ -246,6 +250,10 @@ func (a *App) IngestMemory(ctx context.Context, input IngestMemoryInput) (Ingest
 		if err := insertMemoryTx(ctx, tx, memory); err != nil {
 			return IngestResult{}, fmt.Errorf("写入记忆失败: %w", err)
 		}
+		// KEEP_BOTH 时自动创建 RELATED 关系（best-effort）
+		if action == ArbitrateKeepBoth && semanticTargetID != "" && memoryID != semanticTargetID {
+			insertRelationTx(ctx, tx, memoryID, semanticTargetID, "RELATED", 1.0)
+		}
 	}
 
 	fragments := make([]FragmentInsert, 0, len(chunks))
@@ -266,6 +274,12 @@ func (a *App) IngestMemory(ctx context.Context, input IngestMemoryInput) (Ingest
 	if err := tx.Commit(ctx); err != nil {
 		return IngestResult{}, fmt.Errorf("事务提交失败: %w", err)
 	}
+
+	// 异步生成前瞻记忆（不阻塞 ingest 返回）
+	go func() {
+		bgCtx := context.Background()
+		_ = a.GenerateForesights(bgCtx, memoryID, project.ID, input.Content, summary, input.ContentType)
+	}()
 
 	if action == ArbitrateReplace {
 		return IngestResult{ID: memoryID, Status: "updated"}, nil

@@ -72,6 +72,7 @@ func (s *Store) EnsureSchema(ctx context.Context, dimension int, reset bool) err
 	}
 	if reset {
 		cleanup := `
+DROP TABLE IF EXISTS memory_foresights CASCADE;
 DROP TABLE IF EXISTS fragments CASCADE;
 DROP TABLE IF EXISTS memories CASCADE;
 DROP TABLE IF EXISTS projects CASCADE;
@@ -152,6 +153,29 @@ CREATE TABLE IF NOT EXISTS memory_arbitrations (
   new_summary TEXT,
   model TEXT,
   created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS memory_relations (
+  id BIGSERIAL PRIMARY KEY,
+  source_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  target_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  relation_type TEXT NOT NULL,
+  strength DOUBLE PRECISION DEFAULT 1.0,
+  metadata JSONB,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(source_id, target_id, relation_type)
+);
+
+CREATE TABLE IF NOT EXISTS memory_foresights (
+  id TEXT PRIMARY KEY,
+  source_memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  prediction TEXT NOT NULL,
+  relevance_score DOUBLE PRECISION DEFAULT 0.8,
+  valid_days INT DEFAULT 14,
+  embedding VECTOR(%[1]d),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  expires_at TIMESTAMPTZ
 );
 `, dimension)
 
@@ -272,6 +296,13 @@ CREATE TABLE IF NOT EXISTS memory_arbitrations (
 		"CREATE INDEX IF NOT EXISTS idx_memory_versions_project ON memory_versions(project_id)",
 		"CREATE INDEX IF NOT EXISTS idx_memory_arbitrations_project ON memory_arbitrations(project_id)",
 		"CREATE INDEX IF NOT EXISTS idx_memory_arbitrations_owner ON memory_arbitrations(owner_id)",
+		"CREATE INDEX IF NOT EXISTS idx_memory_relations_source ON memory_relations(source_id)",
+		"CREATE INDEX IF NOT EXISTS idx_memory_relations_target ON memory_relations(target_id)",
+		"CREATE INDEX IF NOT EXISTS idx_memory_relations_type ON memory_relations(relation_type)",
+		"CREATE INDEX IF NOT EXISTS idx_foresights_source ON memory_foresights(source_memory_id)",
+		"CREATE INDEX IF NOT EXISTS idx_foresights_project ON memory_foresights(project_id)",
+		"CREATE INDEX IF NOT EXISTS idx_foresights_expires ON memory_foresights(expires_at)",
+		"CREATE INDEX IF NOT EXISTS idx_foresights_embedding ON memory_foresights USING hnsw (embedding vector_cosine_ops)",
 	}
 	for _, stmt := range indexes {
 		if _, err := s.pool.Exec(ctx, stmt); err != nil {
@@ -656,6 +687,39 @@ func (s *Store) FetchMemorySummary(ctx context.Context, memoryID string) (Memory
 		return MemorySummaryRow{}, err
 	}
 	return row, nil
+}
+
+// FetchRecentMemorySummaries 查询指定项目最近 N 天的记忆摘要列表（用于蒸馏）
+func (s *Store) FetchRecentMemorySummaries(ctx context.Context, projectID string, sinceTs int64, scope string, limit int) ([]MemorySummaryRow, error) {
+	query := `
+SELECT id, COALESCE(summary, '')
+FROM memories
+WHERE project_id = $1 AND ts >= $2`
+	args := []any{projectID, sinceTs}
+	if scope != "" && scope != "all" {
+		query += " AND content_type = $3"
+		args = append(args, scope)
+		query += " ORDER BY ts DESC LIMIT $4"
+		args = append(args, limit)
+	} else {
+		query += " ORDER BY ts DESC LIMIT $3"
+		args = append(args, limit)
+	}
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var results []MemorySummaryRow
+	for rows.Next() {
+		var row MemorySummaryRow
+		if err := rows.Scan(&row.ID, &row.Summary); err != nil {
+			return nil, err
+		}
+		results = append(results, row)
+	}
+	return results, rows.Err()
 }
 
 // SearchMemoryVectors searches memories by avg_embedding for semantic conflict detection
@@ -1248,6 +1312,148 @@ LIMIT 1`
 	return v, nil
 }
 
+// === 记忆间关系边 ===
+
+// InsertRelation 创建记忆间关系边
+func (s *Store) InsertRelation(ctx context.Context, sourceID, targetID, relationType string, strength float64, metadata any) (int64, error) {
+	var metaJSON []byte
+	if metadata != nil {
+		var err error
+		metaJSON, err = json.Marshal(metadata)
+		if err != nil {
+			return 0, fmt.Errorf("metadata 序列化失败: %w", err)
+		}
+	}
+	var metaValue any
+	if len(metaJSON) > 0 {
+		metaValue = string(metaJSON)
+	}
+	var id int64
+	err := s.pool.QueryRow(ctx, `
+INSERT INTO memory_relations (source_id, target_id, relation_type, strength, metadata)
+VALUES ($1, $2, $3, $4, $5::jsonb)
+ON CONFLICT (source_id, target_id, relation_type) DO UPDATE
+SET strength = EXCLUDED.strength, metadata = EXCLUDED.metadata
+RETURNING id`,
+		sourceID, targetID, relationType, strength, metaValue,
+	).Scan(&id)
+	return id, err
+}
+
+// InsertRelationTx 在事务中创建记忆间关系边（best-effort，忽略错误）
+func insertRelationTx(ctx context.Context, tx pgxTx, sourceID, targetID, relationType string, strength float64) {
+	_, _ = tx.Exec(ctx, `
+INSERT INTO memory_relations (source_id, target_id, relation_type, strength)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (source_id, target_id, relation_type) DO NOTHING`,
+		sourceID, targetID, relationType, strength,
+	)
+}
+
+// FetchRelations 查询记忆的关联关系
+func (s *Store) FetchRelations(ctx context.Context, memoryID, direction, relationType string, limit int) ([]RelationRecord, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	var query string
+	var args []any
+
+	switch direction {
+	case "outgoing":
+		query = `
+SELECT id, source_id, target_id, relation_type, COALESCE(strength, 1.0),
+       metadata, EXTRACT(EPOCH FROM created_at)::BIGINT
+FROM memory_relations
+WHERE source_id = $1`
+		args = []any{memoryID}
+	case "incoming":
+		query = `
+SELECT id, source_id, target_id, relation_type, COALESCE(strength, 1.0),
+       metadata, EXTRACT(EPOCH FROM created_at)::BIGINT
+FROM memory_relations
+WHERE target_id = $1`
+		args = []any{memoryID}
+	default: // "both"
+		query = `
+SELECT id, source_id, target_id, relation_type, COALESCE(strength, 1.0),
+       metadata, EXTRACT(EPOCH FROM created_at)::BIGINT
+FROM memory_relations
+WHERE source_id = $1 OR target_id = $1`
+		args = []any{memoryID}
+	}
+
+	if relationType != "" {
+		query += " AND relation_type = $" + fmt.Sprintf("%d", len(args)+1)
+		args = append(args, relationType)
+	}
+	query += " ORDER BY created_at DESC LIMIT $" + fmt.Sprintf("%d", len(args)+1)
+	args = append(args, limit)
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []RelationRecord
+	for rows.Next() {
+		var r RelationRecord
+		var metaJSON []byte
+		if err := rows.Scan(&r.ID, &r.SourceID, &r.TargetID, &r.RelationType, &r.Strength, &metaJSON, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		if len(metaJSON) > 0 {
+			r.Metadata = decodeJSON(metaJSON)
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+// DeleteRelation 删除关系边
+func (s *Store) DeleteRelation(ctx context.Context, id int64) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM memory_relations WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("关系不存在")
+	}
+	return nil
+}
+
+// FetchOutgoingRelationTargets 批量获取多个记忆的 outgoing 关系 target ID
+func (s *Store) FetchOutgoingRelationTargets(ctx context.Context, memoryIDs []string, limit int) (map[string][]string, error) {
+	if len(memoryIDs) == 0 {
+		return map[string][]string{}, nil
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	query := `
+SELECT source_id, target_id
+FROM memory_relations
+WHERE source_id = ANY($1)
+ORDER BY created_at DESC`
+	rows, err := s.pool.Query(ctx, query, memoryIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := map[string][]string{}
+	for rows.Next() {
+		var sourceID, targetID string
+		if err := rows.Scan(&sourceID, &targetID); err != nil {
+			return nil, err
+		}
+		if len(result[sourceID]) < limit {
+			result[sourceID] = append(result[sourceID], targetID)
+		}
+	}
+	return result, rows.Err()
+}
+
 // RestoreMemoryFromVersion 从历史版本恢复记忆
 func (s *Store) RestoreMemoryFromVersion(ctx context.Context, version MemoryVersionInsert) error {
 	tx, err := s.pool.Begin(ctx)
@@ -1292,4 +1498,159 @@ WHERE memory_id = $1 AND replaced_at = $2`, version.MemoryID, version.ReplacedAt
 	}
 
 	return tx.Commit(ctx)
+}
+
+// FetchTopFragmentsByMemoryIDs 获取指定 memory IDs 的第一个片段（用于前瞻召回）
+func (s *Store) FetchTopFragmentsByMemoryIDs(ctx context.Context, memoryIDs []string) ([]FragmentRow, error) {
+	if len(memoryIDs) == 0 {
+		return nil, nil
+	}
+	query := `
+SELECT DISTINCT ON (f.memory_id)
+       f.id, f.memory_id, f.chunk_index, f.content, m.content_type, p.project_key, m.ts, m.chunk_count,
+       COALESCE(m.axes, '{}'::jsonb), COALESCE(m.index_path, '[]'::jsonb),
+       0::float8 AS distance
+FROM fragments f
+JOIN memories m ON f.memory_id = m.id
+JOIN projects p ON m.project_id = p.id
+WHERE f.memory_id = ANY($1)
+ORDER BY f.memory_id, f.chunk_index`
+	rows, err := s.pool.Query(ctx, query, memoryIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanFragmentRows(rows)
+}
+
+// === 前瞻记忆 (Foresight) ===
+
+// InsertForesight 写入一条前瞻预测
+func (s *Store) InsertForesight(ctx context.Context, id, sourceMemoryID, projectID, prediction string, relevanceScore float64, validDays int, embedding []float32) error {
+	expiresAt := foresightExpiresAt(validDays)
+	var embVec any
+	if len(embedding) > 0 {
+		embVec = pgvector.NewVector(embedding)
+	}
+	_, err := s.pool.Exec(ctx, `
+INSERT INTO memory_foresights (id, source_memory_id, project_id, prediction, relevance_score, valid_days, embedding, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		id, sourceMemoryID, projectID, prediction, relevanceScore, validDays, embVec, expiresAt)
+	return err
+}
+
+// SearchForesightVectors 搜索未过期的前瞻记忆（按 project_id 过滤）
+func (s *Store) SearchForesightVectors(ctx context.Context, vector pgvector.Vector, projectID string, limit int) ([]ForesightRow, error) {
+	query := `
+SELECT id, source_memory_id, project_id, prediction, relevance_score,
+       EXTRACT(EPOCH FROM expires_at)::BIGINT
+FROM memory_foresights
+WHERE project_id = $1
+  AND embedding IS NOT NULL
+  AND (expires_at IS NULL OR expires_at > NOW())
+ORDER BY embedding <=> $2
+LIMIT $3`
+	rows, err := s.pool.Query(ctx, query, projectID, vector, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var results []ForesightRow
+	for rows.Next() {
+		var row ForesightRow
+		if err := rows.Scan(&row.ID, &row.SourceMemoryID, &row.ProjectID, &row.Prediction, &row.RelevanceScore, &row.ExpiresAt); err != nil {
+			return nil, err
+		}
+		results = append(results, row)
+	}
+	return results, rows.Err()
+}
+
+// SearchForesightVectorsByOwner 搜索未过期的前瞻记忆（按 owner_id 过滤）
+func (s *Store) SearchForesightVectorsByOwner(ctx context.Context, vector pgvector.Vector, ownerID string, limit int) ([]ForesightRow, error) {
+	query := `
+SELECT f.id, f.source_memory_id, f.project_id, f.prediction, f.relevance_score,
+       EXTRACT(EPOCH FROM f.expires_at)::BIGINT
+FROM memory_foresights f
+JOIN projects p ON f.project_id = p.id
+WHERE p.owner_id = $1
+  AND f.embedding IS NOT NULL
+  AND (f.expires_at IS NULL OR f.expires_at > NOW())
+ORDER BY f.embedding <=> $2
+LIMIT $3`
+	rows, err := s.pool.Query(ctx, query, ownerID, vector, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var results []ForesightRow
+	for rows.Next() {
+		var row ForesightRow
+		if err := rows.Scan(&row.ID, &row.SourceMemoryID, &row.ProjectID, &row.Prediction, &row.RelevanceScore, &row.ExpiresAt); err != nil {
+			return nil, err
+		}
+		results = append(results, row)
+	}
+	return results, rows.Err()
+}
+
+// CleanExpiredForesights 清理过期的前瞻记忆
+func (s *Store) CleanExpiredForesights(ctx context.Context) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM memory_foresights WHERE expires_at IS NOT NULL AND expires_at <= NOW()`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// FetchForesightsByMemory 查询某条记忆的前瞻（未过期）
+func (s *Store) FetchForesightsByMemory(ctx context.Context, memoryID string, limit int) ([]ForesightRow, error) {
+	query := `
+SELECT id, source_memory_id, project_id, prediction, relevance_score,
+       EXTRACT(EPOCH FROM expires_at)::BIGINT
+FROM memory_foresights
+WHERE source_memory_id = $1
+  AND (expires_at IS NULL OR expires_at > NOW())
+ORDER BY created_at DESC
+LIMIT $2`
+	rows, err := s.pool.Query(ctx, query, memoryID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var results []ForesightRow
+	for rows.Next() {
+		var row ForesightRow
+		if err := rows.Scan(&row.ID, &row.SourceMemoryID, &row.ProjectID, &row.Prediction, &row.RelevanceScore, &row.ExpiresAt); err != nil {
+			return nil, err
+		}
+		results = append(results, row)
+	}
+	return results, rows.Err()
+}
+
+// FetchForesightsByProject 查询项目的前瞻（未过期）
+func (s *Store) FetchForesightsByProject(ctx context.Context, projectID string, limit int) ([]ForesightRow, error) {
+	query := `
+SELECT id, source_memory_id, project_id, prediction, relevance_score,
+       EXTRACT(EPOCH FROM expires_at)::BIGINT
+FROM memory_foresights
+WHERE project_id = $1
+  AND (expires_at IS NULL OR expires_at > NOW())
+ORDER BY created_at DESC
+LIMIT $2`
+	rows, err := s.pool.Query(ctx, query, projectID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var results []ForesightRow
+	for rows.Next() {
+		var row ForesightRow
+		if err := rows.Scan(&row.ID, &row.SourceMemoryID, &row.ProjectID, &row.Prediction, &row.RelevanceScore, &row.ExpiresAt); err != nil {
+			return nil, err
+		}
+		results = append(results, row)
+	}
+	return results, rows.Err()
 }

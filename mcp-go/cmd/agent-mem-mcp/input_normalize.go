@@ -38,6 +38,9 @@ func normalizeIngestInput(input IngestMemoryInput, settings Settings, now time.T
 
 	if input.Ts <= 0 {
 		input.Ts = now.Unix()
+	} else if input.Ts > 1_000_000_000_000 {
+		// 自动将毫秒转换为秒
+		input.Ts = input.Ts / 1000
 	}
 	return input, nil
 }

@@ -463,6 +463,120 @@ func cloneAxes(axes MemoryAxes) MemoryAxes {
 	}
 }
 
+// Distill 将多条记忆摘要蒸馏为一段精炼的知识总结
+func (l *LLMClient) Distill(summaries []string, projectKey string) string {
+	if len(summaries) == 0 {
+		return ""
+	}
+	if l.mock {
+		// mock 模式：拼接前 3 条作为蒸馏结果
+		var parts []string
+		for i, s := range summaries {
+			if i >= 3 {
+				break
+			}
+			parts = append(parts, strings.TrimSpace(s))
+		}
+		return "[蒸馏] " + strings.Join(parts, "；")
+	}
+
+	model := strings.TrimSpace(l.settings.LLM.ModelDistill)
+	if model == "" {
+		model = strings.TrimSpace(l.settings.LLM.ModelSummary)
+	}
+
+	// 拼接所有摘要，控制总长度
+	var sb strings.Builder
+	for i, s := range summaries {
+		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, strings.TrimSpace(s)))
+	}
+	summaryBlock := truncate(sb.String(), 12000)
+
+	prompt := fmt.Sprintf(`你是知识蒸馏专家。请将以下来自项目「%s」的多条工作记忆摘要蒸馏为一段精炼的长期知识总结。
+
+要求：
+1. 去除重复信息，合并相似内容
+2. 提取关键发现、决策和结论
+3. 保留因果链和依赖关系（如 A 导致 B，因为 C 所以选择 D）
+4. 保留重要的技术细节和数据指标
+5. 输出结构清晰的知识总结，使用层级标题
+6. 无损核心信息，但去除冗余表述
+
+原始记忆摘要（共 %d 条）：
+%s
+
+请输出蒸馏后的知识总结：`, projectKey, len(summaries), summaryBlock)
+
+	raw, err := l.client.ChatCompletion(context.Background(), model, prompt, 0.3, 2000)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(raw)
+}
+
+// PredictForesights 基于记忆内容生成 1-3 条前瞻预测
+func (l *LLMClient) PredictForesights(content, summary, contentType string) []string {
+	if l.mock {
+		return mockForesights(summary)
+	}
+	model := strings.TrimSpace(l.settings.LLM.ModelSummary)
+	if model == "" {
+		model = "qwen-turbo"
+	}
+
+	prompt := fmt.Sprintf(`你是知识库的前瞻预测器。基于以下记忆内容，预测用户接下来可能需要什么信息或做什么操作。
+
+【记忆类型】%s
+【摘要】%s
+【内容】%s
+
+请输出 JSON 数组，包含 1-3 条简短预测字符串，每条描述一个用户可能的下一步需求。
+示例：["需要查询相关的API文档","可能要实现对应的单元测试","接下来可能需要部署配置"]
+
+只输出 JSON 数组，不要输出其他内容。`, contentType, truncate(summary, 2000), truncate(content, 6000))
+
+	raw, err := l.client.ChatCompletion(context.Background(), model, prompt, 0.3, 300)
+	if err != nil {
+		return nil
+	}
+
+	cleaned := strings.TrimSpace(raw)
+	if strings.HasPrefix(cleaned, "```") {
+		cleaned = strings.Trim(cleaned, "`")
+		cleaned = strings.TrimSpace(strings.TrimPrefix(cleaned, "json"))
+	}
+
+	var predictions []string
+	if err := json.Unmarshal([]byte(cleaned), &predictions); err == nil {
+		if len(predictions) > 3 {
+			predictions = predictions[:3]
+		}
+		return predictions
+	}
+
+	// 尝试提取 JSON 数组
+	start := strings.Index(cleaned, "[")
+	end := strings.LastIndex(cleaned, "]")
+	if start >= 0 && end > start {
+		if err := json.Unmarshal([]byte(cleaned[start:end+1]), &predictions); err == nil {
+			if len(predictions) > 3 {
+				predictions = predictions[:3]
+			}
+			return predictions
+		}
+	}
+
+	return nil
+}
+
+// mockForesights 测试用前瞻生成
+func mockForesights(summary string) []string {
+	if strings.TrimSpace(summary) == "" {
+		return nil
+	}
+	return []string{"可能需要相关文档", "接下来可能进行测试"}
+}
+
 func (l *LLMClient) Rerank(query string, documents []string, topN int) ([]RerankResult, error) {
 	if l.mock {
 		return nil, nil

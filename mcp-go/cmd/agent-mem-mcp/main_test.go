@@ -28,10 +28,12 @@ func TestValidateIngestInput(t *testing.T) {
 	}
 
 	input.ProjectPath = "/test/project"
-	input.ContentType = "invalid"
+	// content_type 已改为允许任意非空字符串，测试空值应报错
+	input.ContentType = ""
 	if err := validateIngestInput(input); err == nil {
-		t.Fatalf("期望 content_type 无效时报错")
+		t.Fatalf("期望 content_type 为空时报错")
 	}
+	input.ContentType = "development" // 恢复有效值
 }
 
 func TestChunkingFixedTokens(t *testing.T) {

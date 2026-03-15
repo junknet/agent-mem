@@ -51,6 +51,7 @@ type SearchResult struct {
 	Ts          int64        `json:"ts,omitempty"`
 	ChunkIndex  int          `json:"chunk_index,omitempty"`
 	TotalChunks int          `json:"total_chunks,omitempty"`
+	RelatedIDs  []string     `json:"related_ids,omitempty"`
 }
 
 type SearchMetadata struct {
@@ -321,6 +322,43 @@ type RollbackOutput struct {
 	Status          string `json:"status"`
 	RestoredMemoryID string `json:"restored_memory_id"`
 	Message         string `json:"message"`
+}
+
+// === 记忆间关系边 ===
+
+type RelationRecord struct {
+	ID           int64  `json:"id"`
+	SourceID     string `json:"source_id"`
+	TargetID     string `json:"target_id"`
+	RelationType string `json:"relation_type"`
+	Strength     float64 `json:"strength"`
+	Metadata     any    `json:"metadata,omitempty"`
+	CreatedAt    int64  `json:"created_at"`
+}
+
+type LinkInput struct {
+	SourceID     string `json:"source_id"`
+	TargetID     string `json:"target_id"`
+	RelationType string `json:"relation_type"`
+	Strength     float64 `json:"strength"`
+	Metadata     any    `json:"metadata,omitempty"`
+}
+
+type LinkOutput struct {
+	ID     int64  `json:"id"`
+	Status string `json:"status"`
+}
+
+type RelationsInput struct {
+	MemoryID     string `json:"memory_id"`
+	Direction    string `json:"direction,omitempty"`
+	RelationType string `json:"relation_type,omitempty"`
+	Limit        int    `json:"limit,omitempty"`
+}
+
+type RelationsResponse struct {
+	Relations []RelationRecord `json:"relations"`
+	Metadata  SearchMetadata   `json:"metadata"`
 }
 
 // === 记忆演进链 ===

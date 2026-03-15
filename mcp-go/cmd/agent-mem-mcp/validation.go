@@ -18,12 +18,13 @@ func (e *AppError) Error() string {
 	return e.Message
 }
 
+// contentTypeSet 保留向后兼容，用于 scope 过滤
 var contentTypeSet = map[string]bool{
-	"requirement": true, // 需求功能：PRD、功能描述、业务规则
-	"plan":        true, // 计划任务：任务清单、里程碑、TODO、执行步骤
-	"development": true, // 开发：架构设计、API定义、实现方案
-	"testing":     true, // 测试验收：测试计划、用例、验收报告
-	"insight":     true, // 经验沉淀：踩坑记录、最佳实践、注意事项
+	"requirement": true,
+	"plan":        true,
+	"development": true,
+	"testing":     true,
+	"insight":     true,
 }
 
 func validateIngestInput(input IngestMemoryInput) error {
@@ -42,8 +43,16 @@ func validateIngestInput(input IngestMemoryInput) error {
 	if err := validateProjectPathOptional(input.ProjectPath); err != nil {
 		return err
 	}
-	if !contentTypeSet[input.ContentType] {
-		return newValidationError("invalid_request", "ERR_INVALID_CONTENT_TYPE", "content_type 无效", 400)
+	// content_type 允许任意非空字符串，不再强制 5 类枚举
+	ct := strings.TrimSpace(input.ContentType)
+	if ct == "" {
+		return newValidationError("invalid_request", "ERR_INVALID_CONTENT_TYPE", "content_type 不能为空", 400)
+	}
+	if len([]rune(ct)) > 50 {
+		return newValidationError("invalid_request", "ERR_INVALID_CONTENT_TYPE", "content_type 过长", 400)
+	}
+	if containsControl(ct) {
+		return newValidationError("invalid_request", "ERR_INVALID_CONTENT_TYPE", "content_type 包含非法字符", 400)
 	}
 	if strings.TrimSpace(input.Content) == "" {
 		return newValidationError("invalid_request", "ERR_INVALID_CONTENT", "content 不能为空", 400)
@@ -106,11 +115,11 @@ func validateSearchInput(input SearchInput) error {
 	if len([]rune(query)) > 1000 {
 		return newValidationError("invalid_request", "ERR_INVALID_QUERY", "query 过长", 400)
 	}
-	if input.Scope == "" {
-		return newValidationError("invalid_request", "ERR_INVALID_SCOPE", "scope 必填", 400)
-	}
-	if input.Scope != "all" && !contentTypeSet[input.Scope] {
-		return newValidationError("invalid_request", "ERR_INVALID_SCOPE", "scope 无效", 400)
+	// scope: "all" 表示全类型搜索，其他值按 content_type 过滤（不再限制为 5 类枚举）
+	if input.Scope != "" && input.Scope != "all" {
+		if len([]rune(input.Scope)) > 50 || containsControl(input.Scope) {
+			return newValidationError("invalid_request", "ERR_INVALID_SCOPE", "scope 无效", 400)
+		}
 	}
 	if err := validateSearchProfilePtr(input.Profile); err != nil {
 		return err
@@ -297,12 +306,14 @@ func validateTimestamp(ts int64) error {
 	if ts <= 0 {
 		return newValidationError("invalid_request", "ERR_INVALID_TS", "ts 必须为正整数", 400)
 	}
-	maxFuture := time.Now().UTC().Add(10 * time.Second).Unix()
-	if ts > maxFuture {
-		return newValidationError("invalid_request", "ERR_INVALID_TS", "ts 不能超过当前时间", 400)
+	// 自动检测并转换毫秒为秒（13位数字视为毫秒）
+	normalized := ts
+	if normalized > 1_000_000_000_000 {
+		normalized = normalized / 1000
 	}
-	if ts > 9_000_000_000_000 {
-		return newValidationError("invalid_request", "ERR_INVALID_TS", "ts 超出有效范围", 400)
+	maxFuture := time.Now().UTC().Add(30 * time.Second).Unix()
+	if normalized > maxFuture {
+		return newValidationError("invalid_request", "ERR_INVALID_TS", "ts 不能超过当前时间", 400)
 	}
 	return nil
 }
