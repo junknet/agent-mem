@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -52,6 +53,8 @@ func (a *App) EnsureSchema(ctx context.Context, reset bool) error {
 
 func buildServer(app *App) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{Name: "agent-mem", Version: "2.0.0"}, &mcp.ServerOptions{
+		Logger:    slog.Default(),
+		KeepAlive: 30 * time.Second,
 		Instructions: `云记忆中心 MCP 服务 - AI 知识库
 
 ## 核心流程

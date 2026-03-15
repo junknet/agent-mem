@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -60,14 +61,24 @@ func main() {
 		log.Fatalf("[CRITICAL] 不支持的 transport: %s", *transport)
 	}
 
+	logger := slog.Default()
+
 	mux := http.NewServeMux()
 	if *transport == "sse" || *transport == "http" || *transport == "both" {
 		sseHandler := mcp.NewSSEHandler(func(*http.Request) *mcp.Server { return server }, nil)
 		mux.Handle("/sse", sseHandler)
+		log.Println("已注册 SSE 端点: /sse")
 	}
 	if *transport == "streamable" || *transport == "http" || *transport == "both" {
-		streamHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
+		streamHandler := mcp.NewStreamableHTTPHandler(
+			func(*http.Request) *mcp.Server { return server },
+			&mcp.StreamableHTTPOptions{
+				SessionTimeout: 30 * time.Minute,
+				Logger:         logger,
+			},
+		)
 		mux.Handle("/mcp", streamHandler)
+		log.Println("已注册 Streamable HTTP 端点: /mcp")
 	}
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -82,9 +93,11 @@ func main() {
 		Addr:              addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 30 * time.Second,
-		WriteTimeout:      120 * time.Second,
-		IdleTimeout:       300 * time.Second,
-		MaxHeaderBytes:    1 << 20, // 1MB
+		// WriteTimeout 必须为 0：SSE 和 Streamable HTTP 都需要长连接流，
+		// 非零值会在超时后强制关闭连接，导致客户端 session 丢失。
+		WriteTimeout:   0,
+		IdleTimeout:    300 * time.Second,
+		MaxHeaderBytes: 1 << 20,
 	}
 
 	// 优雅退出：监听 SIGINT/SIGTERM
