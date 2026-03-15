@@ -160,9 +160,10 @@ def test_sse(host: str, port: int, token: str) -> bool:
 
     msg_id = 0
 
+    post_conn = http.client.HTTPConnection(host, port, timeout=20)
+
     def post_msg(payload: dict, add_token: bool = False) -> dict | None:
         nonlocal msg_id
-        conn = http.client.HTTPConnection(host, port, timeout=15)
         url: str = endpoint
         if add_token and token:
             url = (
@@ -170,15 +171,25 @@ def test_sse(host: str, port: int, token: str) -> bool:
                 if "?" in endpoint
                 else f"{endpoint}?token={token}"
             )
-        conn.request(
-            "POST",
-            url,
-            json.dumps(payload).encode(),
-            {"Content-Type": "application/json"},
-        )
-        resp = conn.getresponse()
-        resp.read()
-        conn.close()
+
+        body = json.dumps(payload).encode()
+        headers = {"Content-Type": "application/json"}
+
+        # 复用同一个 POST 连接，避免弱网络下频繁建连超时。
+        for attempt in (1, 2):
+            try:
+                post_conn.request("POST", url, body, headers)
+                resp = post_conn.getresponse()
+                resp.read()
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                try:
+                    post_conn.close()
+                except Exception:
+                    pass
+                post_conn.connect()
         if "id" in payload:
             try:
                 return result_queue.get(timeout=15)
