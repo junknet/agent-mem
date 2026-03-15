@@ -1403,7 +1403,8 @@ WHERE source_id = $1 OR target_id = $1`
 			return nil, err
 		}
 		if len(metaJSON) > 0 {
-			r.Metadata = decodeJSON(metaJSON)
+			// 历史数据可能不是 string map；这里做一次尽量温和的收敛，保证对外 schema 稳定。
+			r.Metadata = decodeStringMapJSON(metaJSON)
 		}
 		results = append(results, r)
 	}

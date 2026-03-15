@@ -290,10 +290,10 @@ type IndexResponse struct {
 // === 仲裁历史与回滚 ===
 
 type ArbitrationHistoryInput struct {
-	OwnerID   string `json:"owner_id"`
-	MemoryID  string `json:"memory_id,omitempty"`  // 可选：查特定记忆的仲裁历史
+	OwnerID    string `json:"owner_id"`
+	MemoryID   string `json:"memory_id,omitempty"`   // 可选：查特定记忆的仲裁历史
 	ProjectKey string `json:"project_key,omitempty"` // 可选：查特定项目的仲裁历史
-	Limit     int    `json:"limit"`
+	Limit      int    `json:"limit"`
 }
 
 type ArbitrationRecord struct {
@@ -319,29 +319,32 @@ type RollbackInput struct {
 }
 
 type RollbackOutput struct {
-	Status          string `json:"status"`
+	Status           string `json:"status"`
 	RestoredMemoryID string `json:"restored_memory_id"`
-	Message         string `json:"message"`
+	Message          string `json:"message"`
 }
 
 // === 记忆间关系边 ===
 
 type RelationRecord struct {
-	ID           int64  `json:"id"`
-	SourceID     string `json:"source_id"`
-	TargetID     string `json:"target_id"`
-	RelationType string `json:"relation_type"`
+	ID           int64   `json:"id"`
+	SourceID     string  `json:"source_id"`
+	TargetID     string  `json:"target_id"`
+	RelationType string  `json:"relation_type"`
 	Strength     float64 `json:"strength"`
-	Metadata     any    `json:"metadata,omitempty"`
-	CreatedAt    int64  `json:"created_at"`
+	// metadata 只允许 string map：Claude Code 对 boolean JSON Schema（true/false）不兼容。
+	Metadata  map[string]string `json:"metadata,omitempty"`
+	CreatedAt int64             `json:"created_at"`
 }
 
 type LinkInput struct {
 	SourceID     string `json:"source_id"`
 	TargetID     string `json:"target_id"`
 	RelationType string `json:"relation_type"`
-	Strength     float64 `json:"strength"`
-	Metadata     any    `json:"metadata,omitempty"`
+	// strength 可选：未提供时服务端默认 1.0。
+	Strength *float64 `json:"strength,omitempty"`
+	// metadata 只允许 string map：避免生成 boolean JSON Schema（Claude Code 会拒绝加载工具）。
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 type LinkOutput struct {
@@ -377,8 +380,8 @@ type MemoryVersion struct {
 }
 
 type MemoryChainResponse struct {
-	MemoryID       string          `json:"memory_id"`
-	CurrentSummary string          `json:"current_summary"`
-	Versions       []MemoryVersion `json:"versions"` // 历史版本（从新到旧）
+	MemoryID       string              `json:"memory_id"`
+	CurrentSummary string              `json:"current_summary"`
+	Versions       []MemoryVersion     `json:"versions"`     // 历史版本（从新到旧）
 	Arbitrations   []ArbitrationRecord `json:"arbitrations"` // 相关仲裁记录
 }

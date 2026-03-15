@@ -553,7 +553,10 @@ func (a *App) LinkMemories(ctx context.Context, input LinkInput) (LinkOutput, er
 		return LinkOutput{}, newValidationError("invalid_request", "ERR_INVALID_RELATION_TYPE", "relation_type 必须是 FOLLOWING/DERIVED_FROM/CONTRADICTS/SUPPORTS/RELATED", 400)
 	}
 
-	strength := input.Strength
+	strength := 1.0
+	if input.Strength != nil {
+		strength = *input.Strength
+	}
 	if strength <= 0 {
 		strength = 1.0
 	}

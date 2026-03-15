@@ -17,6 +17,37 @@ func decodeJSON(raw []byte) any {
 	return out
 }
 
+func decodeStringMapJSON(raw []byte) map[string]string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil
+	}
+	out := make(map[string]string, len(obj))
+	for k, v := range obj {
+		if v == nil {
+			continue
+		}
+		switch vv := v.(type) {
+		case string:
+			out[k] = strings.TrimSpace(vv)
+		default:
+			b, err := json.Marshal(v)
+			if err != nil {
+				out[k] = ""
+				continue
+			}
+			out[k] = string(b)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func formatTime(t time.Time) string {
 	if t.IsZero() {
 		return ""
