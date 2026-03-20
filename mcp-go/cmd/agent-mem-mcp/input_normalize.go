@@ -11,6 +11,7 @@ const (
 	defaultTimelineLimit     = 20
 	defaultListProjectsLimit = 50
 	defaultIndexLimit        = 20
+	maxClockSkew             = 10 * time.Minute
 )
 
 func normalizeIngestInput(input IngestMemoryInput, settings Settings, now time.Time) (IngestMemoryInput, error) {
@@ -38,11 +39,17 @@ func normalizeIngestInput(input IngestMemoryInput, settings Settings, now time.T
 
 	if input.Ts <= 0 {
 		input.Ts = now.Unix()
-	} else if input.Ts > 1_000_000_000_000 {
-		// 自动将毫秒转换为秒
-		input.Ts = input.Ts / 1000
+	} else {
+		input.Ts = normalizeTimestampSeconds(input.Ts)
 	}
 	return input, nil
+}
+
+func normalizeTimestampSeconds(ts int64) int64 {
+	for ts > 9_999_999_999 {
+		ts = ts / 1000
+	}
+	return ts
 }
 
 func normalizeSearchInput(input SearchInput, settings Settings) (SearchInput, error) {

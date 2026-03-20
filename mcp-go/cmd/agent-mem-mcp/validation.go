@@ -306,12 +306,8 @@ func validateTimestamp(ts int64) error {
 	if ts <= 0 {
 		return newValidationError("invalid_request", "ERR_INVALID_TS", "ts 必须为正整数", 400)
 	}
-	// 自动检测并转换毫秒为秒（13位数字视为毫秒）
-	normalized := ts
-	if normalized > 1_000_000_000_000 {
-		normalized = normalized / 1000
-	}
-	maxFuture := time.Now().UTC().Add(30 * time.Second).Unix()
+	normalized := normalizeTimestampSeconds(ts)
+	maxFuture := time.Now().UTC().Add(maxClockSkew).Unix()
 	if normalized > maxFuture {
 		return newValidationError("invalid_request", "ERR_INVALID_TS", "ts 不能超过当前时间", 400)
 	}

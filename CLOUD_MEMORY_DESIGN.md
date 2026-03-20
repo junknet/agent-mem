@@ -244,7 +244,7 @@ CREATE TABLE memory_arbitrations (
 - owner_id（不传默认使用服务端配置）
 - project_key（跨机器稳定项目标识）
 - machine_name / project_path（仅记录来源）
-- ts（Unix 秒，不传默认当前时间）
+- ts（Unix 时间戳，不传默认当前时间；兼容秒/毫秒/微秒/纳秒）
 
 **响应**：
 - status: created / updated / skipped

@@ -48,6 +48,49 @@ func TestNormalizeIngestInputOwnerMismatch(t *testing.T) {
 	}
 }
 
+func TestNormalizeIngestInputTimestampUnits(t *testing.T) {
+	settings := defaultSettings()
+	now := time.Date(2026, 1, 26, 0, 0, 0, 0, time.UTC)
+	base := IngestMemoryInput{
+		ProjectName: "agent-mem",
+		ContentType: "development",
+		Content:     "test",
+	}
+	tests := []struct {
+		name string
+		ts   int64
+		want int64
+	}{
+		{name: "seconds", ts: 1769385600, want: 1769385600},
+		{name: "milliseconds", ts: 1769385600123, want: 1769385600},
+		{name: "microseconds", ts: 1769385600123456, want: 1769385600},
+		{name: "nanoseconds", ts: 1769385600123456789, want: 1769385600},
+	}
+	for _, tt := range tests {
+		input := base
+		input.Ts = tt.ts
+		normalized, err := normalizeIngestInput(input, settings, now)
+		if err != nil {
+			t.Fatalf("%s 归一化失败: %v", tt.name, err)
+		}
+		if normalized.Ts != tt.want {
+			t.Fatalf("%s 归一化错误: got=%d want=%d", tt.name, normalized.Ts, tt.want)
+		}
+	}
+}
+
+func TestValidateTimestampAllowsClockSkew(t *testing.T) {
+	ts := time.Now().UTC().Add(5 * time.Minute).Unix()
+	if err := validateTimestamp(ts); err != nil {
+		t.Fatalf("期望 10 分钟内未来时间通过校验: %v", err)
+	}
+
+	ts = time.Now().UTC().Add(11 * time.Minute).Unix()
+	if err := validateTimestamp(ts); err == nil {
+		t.Fatalf("期望超过 10 分钟未来时间报错")
+	}
+}
+
 func TestNormalizeSearchInputDefaults(t *testing.T) {
 	settings := defaultSettings()
 	settings.Project.OwnerID = "personal"

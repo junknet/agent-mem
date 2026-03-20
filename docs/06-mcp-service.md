@@ -29,7 +29,7 @@ go build -o ../out/agent-mem-mcp ./cmd/agent-mem-mcp
 - owner_id（不传默认使用服务端配置）
 - project_key（跨机器稳定项目标识）
 - machine_name / project_path（仅做来源记录）
-- ts（不传默认当前时间）
+- ts（不传默认当前时间；兼容秒/毫秒/微秒/纳秒输入）
 
 ### mem.search
 
