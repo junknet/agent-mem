@@ -14,6 +14,40 @@ go build -o ../out/agent-mem-mcp ./cmd/agent-mem-mcp
 - `http` 同时开启 `/sse` 与 `/mcp`
 - `stdio` 适合本地调试：`../out/agent-mem-mcp --transport stdio`
 
+## Supervisor 常驻部署
+
+这台机器建议统一由 `supervisor` 托管，而不是混用 `systemd` 与交互式 shell：
+
+```bash
+sudo cp deploy/memory-mcp.supervisor.conf /etc/supervisor/conf.d/memory-mcp.conf
+sudo supervisorctl reread
+sudo supervisorctl update
+sudo supervisorctl restart memory-mcp
+```
+
+关键点：
+- `autostart=true`：机器重启或 `supervisord` 重启后自动拉起，避免服务长期离线
+- `autorestart=true`：进程异常退出后自动恢复
+- `stopasgroup=true` / `killasgroup=true`：确保整组进程一起退出，避免残留占端口
+- `AGENT_TOOLS_ENV` 与 `AGENT_MEM_CONFIG`：统一读取 `.env` 和配置文件
+
+## 一键远端部署
+
+本地构建、上传、切换二进制、刷新 `supervisor`、重启并做健康检查：
+
+```bash
+scripts/deploy_remote.sh root@47.110.255.240
+```
+
+可选环境变量：
+- `AGENT_MEM_REMOTE_DIR`：远端目录，默认 `/opt/memory-mcp`
+- `AGENT_MEM_REMOTE_SERVICE`：Supervisor 服务名，默认 `memory-mcp`
+- `AGENT_MEM_REMOTE_PORT`：服务端口，默认 `8787`
+
+脚本会额外处理两件事：
+- 自动备份远端旧二进制与旧 `memory-mcp.conf`
+- 如果发现旧的 `agent-mem-mcp.service`，会停止并禁用，避免和 `supervisor` 抢同一个端口
+
 ## 工具说明
 
 ### mem.ingest_memory
